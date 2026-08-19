@@ -146,11 +146,20 @@ def update_database_node(state: AgentState):
 def determine_intent_node(state: AgentState):
     """Determines if the user wants a plan or is just chatting."""
     try:
-        latest_msg = state["messages"][-1].content
+        # FIX: Look at the last 4 messages to maintain conversational context!
+        recent_msgs = state["messages"][-4:]
+        context_str = "\n".join([f"{'User' if m.type == 'human' else 'AI'}: {m.content}" for m in recent_msgs])
+        
         intent_analyzer = llm.with_structured_output(IntentSchema)
         result = intent_analyzer.invoke([
-            SystemMessage(content="Determine if the user is asking to create, generate, or start a new workout plan/routine. If yes, intent is 'plan'. Otherwise, 'chat'."),
-            HumanMessage(content=latest_msg)
+            SystemMessage(content=(
+                "Analyze the recent conversation context. "
+                "Is the user's overarching goal right now to generate/create a workout plan? "
+                "If they previously asked for a plan and are now providing their age, weight, goals, or preferences to complete the profile for it, the intent is STILL 'plan'. "
+                "If they explicitly ask for a plan, the intent is 'plan'. "
+                "If they are just asking general fitness questions, intent is 'chat'."
+            )),
+            HumanMessage(content=f"Recent Conversation:\n{context_str}")
         ])
         intent_val = result.intent if result else "chat"
         return {"intent": intent_val}
@@ -184,7 +193,8 @@ def normal_chat_node(state: AgentState):
     profile_str = json.dumps(state["user_profile"])
     sys_prompt = f"""You are CoachSaab, a smart AI fitness coach. 
     User Profile: {profile_str}
-    Keep responses brief, actionable, and conversational (1-3 sentences max). Do not use markdown styling."""
+    Keep responses brief, actionable, and conversational (1-3 sentences max). Do not use markdown styling.
+    CRITICAL RULE: NEVER generate a full day-by-day workout plan or routine in chat. If the user asks for a plan, tell them to say 'Generate my plan' so the system can build it officially."""
     
     response = llm.invoke([SystemMessage(content=sys_prompt)] + state["messages"])
     return {"messages": [response]}
