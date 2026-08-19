@@ -25,20 +25,22 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.2)
 
 # ==========================================
-# PYDANTIC SCHEMAS FOR STRUCTURED EXTRACTION
+# PYDANTIC SCHEMAS
 # ==========================================
-class ExerciseConfig(BaseModel):
-    activity_key: str = Field(..., description="Canonical key, e.g., 'squat', 'push_up'")
-    sets: int = Field(..., gt=0, description="Number of sets")
-    reps: int = Field(..., gt=0, description="Number of reps per set")
-    progression: str = Field(..., description="How to progress over the weeks")
+class DailyWorkout(BaseModel):
+    day_number: int = Field(..., description="Day of the week (1 to 7)")
+    focus: str = Field(..., description="Workout focus (e.g., 'UPPER BODY', 'LOWER BODY', 'ACTIVE RECOVERY', 'REST DAY')")
+    exercises: List[str] = Field(..., description="List of exercise names (e.g., ['Push Up', 'Plank']). Empty if rest day.")
+    is_rest: bool = Field(..., description="True if this is a rest day")
 
 class WorkoutPlanSchema(BaseModel):
     duration_weeks: int = Field(..., gt=0, le=12, description="Duration in weeks (max 12)")
     goal: str = Field(..., description="Main objective of the plan")
-    exercises: List[ExerciseConfig] = Field(..., description="List of structured exercises")
-    notes: str = Field(..., description="Additional coaching advice")
+    notes: str = Field(..., description="Additional coaching advice and progression instructions")
+    schedule: List[DailyWorkout] = Field(..., description="A 7-day schedule template (Days 1-7) that repeats each week")
 
+# ==========================================
+# AGENT TOOLS
 class ProfileExtractionSchema(BaseModel):
     age: Optional[int] = Field(None, description="Extracted age")
     weight_kg: Optional[float] = Field(None, description="Extracted weight in kg")
