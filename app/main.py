@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy import create_engine, text
-from typing import Optional, List, Annotated, Literal, Any, Dict
+from typing import Optional, List, Annotated, Literal
 import os
 import json
 import re
@@ -20,10 +20,12 @@ DATABASE_URL = os.getenv("DATABASE_URL", "")
 engine = create_engine(DATABASE_URL)
 
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
+
+llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.2)
 
 # ==========================================
-# 1. STRICT SCHEMAS
+# PYDANTIC SCHEMAS FOR STRUCTURED EXTRACTION
 # ==========================================
 class ExerciseConfig(BaseModel):
     activity_key: str = Field(..., description="Canonical key, e.g., 'squat', 'push_up'")
@@ -37,216 +39,167 @@ class WorkoutPlanSchema(BaseModel):
     exercises: List[ExerciseConfig] = Field(..., description="List of structured exercises")
     notes: str = Field(..., description="Additional coaching advice")
 
-class UserProfileUpdate(BaseModel):
-    age: Optional[int] = Field(None, description="User's age, if mentioned.")
-    weight_kg: Optional[float] = Field(None, description="User's weight in kg, if mentioned.")
-    goals: Optional[List[str]] = Field(None, description="User's fitness goals, if mentioned.")
-    preferred_categories: Optional[List[str]] = Field(None, description="Preferred exercise types, if mentioned.")
+class ProfileExtractionSchema(BaseModel):
+    age: Optional[int] = Field(None, description="Extracted age")
+    weight_kg: Optional[float] = Field(None, description="Extracted weight in kg")
+    goals: Optional[List[str]] = Field(None, description="Extracted fitness goals")
+    preferred_categories: Optional[List[str]] = Field(None, description="Extracted preferred exercise types")
 
-class UserIntent(BaseModel):
-    intent: Literal["generate_plan", "normal_chat"] = Field(
-        ..., description="Does the user want to create/update a workout plan, or just chat normally?"
-    )
+class IntentSchema(BaseModel):
+    intent: Literal["chat", "plan"] = Field(description="Is the user asking for a workout plan/routine ('plan') or just having a conversation ('chat')?")
 
 # ==========================================
-# 2. GRAPH STATE DEFINITION
+# LANGGRAPH STATE & NODES (Deterministic Flow)
 # ==========================================
 class AgentState(TypedDict):
     messages: Annotated[list, add_messages]
     user_id: str
     user_profile: dict
-    missing_fields: List[str]
-    extracted_profile: Optional[UserProfileUpdate]
-    intent: Optional[str]
+    missing_fields: list
+    extracted_updates: Optional[dict]
+    intent: str
 
-# ==========================================
-# 3. LLM INITIALIZATION
-# ==========================================
-llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.1)
-
-# Extractors (Forcing specific JSON outputs)
-profile_extractor = llm.with_structured_output(UserProfileUpdate)
-intent_classifier = llm.with_structured_output(UserIntent)
-plan_generator = llm.with_structured_output(WorkoutPlanSchema)
-
-# ==========================================
-# 4. GRAPH NODES (Deterministic State Machine)
-# ==========================================
-def load_user_state_node(state: AgentState):
-    """Reads DB, populates profile and calculates missing fields."""
+def load_state_node(state: AgentState):
+    """Loads the user's current profile from the database and calculates missing fields."""
+    user_id = state["user_id"]
     with engine.connect() as conn:
         user_row = conn.execute(
-            text("SELECT name, gender, age, weight_kg, goals, preferred_categories FROM users WHERE user_id = :uid"),
-            {"uid": state["user_id"]}
+            text("SELECT name, age, weight_kg, goals, preferred_categories FROM users WHERE user_id = :uid"), 
+            {"uid": user_id}
         ).mappings().fetchone()
-        
-    profile = dict(user_row) if user_row else {}
-    missing = []
-    if profile.get('age') is None: missing.append("Age")
-    if profile.get('weight_kg') is None: missing.append("Weight (kg)")
-    if not profile.get('goals'): missing.append("Fitness Goals")
-    if not profile.get('preferred_categories'): missing.append("Preferred Exercise Types (e.g. bodyweight, legs)")
     
+    if not user_row:
+        return {"user_profile": {}, "missing_fields": ["Profile Error"]}
+
+    profile = dict(user_row)
+    missing = []
+    if profile.get("age") is None: missing.append("Age")
+    if profile.get("weight_kg") is None: missing.append("Weight (kg)")
+    if not profile.get("goals"): missing.append("Fitness Goals")
+    if not profile.get("preferred_categories"): missing.append("Preferred Exercises")
+
     return {"user_profile": profile, "missing_fields": missing}
 
 def extract_profile_node(state: AgentState):
-    """Uses LLM to extract any new profile info from the latest user message."""
-    latest_message = state["messages"][-1].content
-    prompt = f"Extract any fitness profile info from this message: '{latest_message}'. If a field isn't mentioned, leave it null."
-    extracted = profile_extractor.invoke([HumanMessage(content=prompt)])
-    return {"extracted_profile": extracted}
+    """Passively extracts any profile data mentioned in the latest user message."""
+    latest_msg = state["messages"][-1].content
+    extractor = llm.with_structured_output(ProfileExtractionSchema)
+    extracted = extractor.invoke([
+        SystemMessage(content="Extract any age, weight, goals, or exercise preferences mentioned. Return null for fields not mentioned."),
+        HumanMessage(content=latest_msg)
+    ])
+    return {"extracted_updates": extracted.model_dump(exclude_none=True)}
 
 def update_database_node(state: AgentState):
-    """Updates PostgreSQL if new data was extracted, merging lists safely."""
-    extracted = state.get("extracted_profile")
-    if not extracted:
-        return {}
-
-    user_id = state["user_id"]
-    updates = []
-    params = {"uid": user_id}
+    """Merges new profile extractions into the database (arrays are appended)."""
+    updates = state.get("extracted_updates", {})
+    if not updates:
+        return {} # Nothing to update
     
-    if extracted.age is not None:
-        updates.append("age = :age")
-        params["age"] = extracted.age
-    if extracted.weight_kg is not None:
-        updates.append("weight_kg = :weight")
-        params["weight"] = extracted.weight_kg
+    user_id = state["user_id"]
+    profile = state["user_profile"]
+    
+    set_clauses = []
+    params = {"uid": user_id}
 
-    # Safe Merging for Lists (Read first, then merge)
-    if extracted.goals or extracted.preferred_categories:
-        with engine.connect() as conn:
-            current_data = conn.execute(
-                text("SELECT goals, preferred_categories FROM users WHERE user_id = :uid"),
-                {"uid": user_id}
-            ).mappings().fetchone()
-            
-            if extracted.goals:
-                existing_goals = list(current_data['goals'] or [])
-                # Add only new goals
-                new_goals = [g for g in extracted.goals if g not in existing_goals]
-                merged_goals = existing_goals + new_goals
-                updates.append("goals = :goals")
-                params["goals"] = merged_goals
-                
-            if extracted.preferred_categories:
-                existing_prefs = list(current_data['preferred_categories'] or [])
-                new_prefs = [p for p in extracted.preferred_categories if p not in existing_prefs]
-                merged_prefs = existing_prefs + new_prefs
-                updates.append("preferred_categories = :prefs")
-                params["prefs"] = merged_prefs
+    if "age" in updates:
+        set_clauses.append("age = :age")
+        params["age"] = updates["age"]
+    if "weight_kg" in updates:
+        set_clauses.append("weight_kg = :weight")
+        params["weight"] = updates["weight_kg"]
         
-    if updates:
+    # MERGE ARRAYS INSTEAD OF OVERWRITING
+    if "goals" in updates:
+        existing = profile.get("goals") or []
+        merged = list(set(existing + updates["goals"]))
+        set_clauses.append("goals = :goals")
+        params["goals"] = merged
+        
+    if "preferred_categories" in updates:
+        existing = profile.get("preferred_categories") or []
+        merged = list(set(existing + updates["preferred_categories"]))
+        set_clauses.append("preferred_categories = :prefs")
+        params["prefs"] = merged
+
+    if set_clauses:
         with engine.begin() as conn:
-            query = text(f"UPDATE users SET {', '.join(updates)}, updated_at = now() WHERE user_id = :uid")
+            query = text(f"UPDATE users SET {', '.join(set_clauses)}, updated_at = now() WHERE user_id = :uid")
             conn.execute(query, params)
             
-    # Re-run load state to get fresh missing_fields directly from Truth (DB)
-    return load_user_state_node(state)
+    # Trigger a state reload for subsequent nodes
+    return load_state_node(state)
 
 def determine_intent_node(state: AgentState):
-    """Classifies if the user is asking for a routine/plan or just chatting."""
-    latest_message = state["messages"][-1].content
-    intent_result = intent_classifier.invoke([HumanMessage(content=latest_message)])
-    return {"intent": intent_result.intent}
+    """Determines if the user wants a plan or is just chatting."""
+    latest_msg = state["messages"][-1].content
+    intent_analyzer = llm.with_structured_output(IntentSchema)
+    result = intent_analyzer.invoke([
+        SystemMessage(content="Determine if the user is asking to create, generate, or start a new workout plan/routine. If yes, intent is 'plan'. Otherwise, 'chat'."),
+        HumanMessage(content=latest_msg)
+    ])
+    return {"intent": result.intent}
+
+def route_intent(state: AgentState):
+    """Routes the graph based on intent and profile completeness."""
+    if state["intent"] == "plan":
+        if len(state["missing_fields"]) > 0:
+            return "ask_question"
+        else:
+            return "generate_plan"
+    return "normal_chat"
 
 def ask_question_node(state: AgentState):
-    """Generates a polite question for exactly ONE missing field."""
+    """Asks for exactly ONE missing profile field."""
     missing = state["missing_fields"][0]
-    prompt = f"You are CoachSaab. The user wants to create a workout plan, but their profile is incomplete. Ask them politely and conversationally for their {missing}. Keep it to 1-2 sentences max. Do not ask for anything else."
+    prompt = f"The user wants a plan, but we are missing: {missing}. Ask them for it politely and conversationally in 1 short sentence."
     response = llm.invoke([SystemMessage(content=prompt)])
     return {"messages": [response]}
 
+def normal_chat_node(state: AgentState):
+    """Handles standard fitness conversation with full context."""
+    profile_str = json.dumps(state["user_profile"])
+    sys_prompt = f"""You are CoachSaab, a smart AI fitness coach. 
+    User Profile: {profile_str}
+    Keep responses brief, actionable, and conversational (1-3 sentences max). Do not use markdown styling."""
+    
+    # We only send the conversation history to the standard chat node
+    response = llm.invoke([SystemMessage(content=sys_prompt)] + state["messages"])
+    return {"messages": [response]}
+
 def generate_plan_node(state: AgentState):
-    """Generates a structured plan via LLM, saves it to PostgreSQL, and replies."""
-    profile = state["user_profile"]
-    prompt = f"""Generate a 4-12 week structured workout plan based on this user:
-    Name: {profile.get('name')}
-    Age: {profile.get('age')}
-    Weight: {profile.get('weight_kg')} kg
-    Goals: {', '.join(profile.get('goals', []))}
-    Preferences: {', '.join(profile.get('preferred_categories', []))}
+    """Forces the LLM to output a strict JSON plan, saves to DB, and returns confirmation."""
+    profile_str = json.dumps(state["user_profile"])
+    plan_generator = llm.with_structured_output(WorkoutPlanSchema)
     
-    Return the plan exactly matching the required JSON schema."""
+    # 1. Generate Structured Plan
+    plan_data = plan_generator.invoke([
+        SystemMessage(content=f"Create a highly effective custom workout plan for this user. User Profile: {profile_str}"),
+        HumanMessage(content="Generate my plan.")
+    ])
     
-    plan_data = plan_generator.invoke([SystemMessage(content=prompt)])
-    
-    # Save to PostgreSQL (Truth)
+    # 2. Save to Database
+    user_id = state["user_id"]
     db_json = plan_data.model_dump()
     db_json["status"] = "active"
     
-    try:
-        with engine.begin() as conn:
-            conn.execute(text("UPDATE workout_plans SET is_active = false WHERE user_id = :uid"), {"uid": state["user_id"]})
-            query = text("INSERT INTO workout_plans (user_id, plan_name, plan_json, is_active) VALUES (:uid, :name, :data, true)")
-            conn.execute(query, {"uid": state["user_id"], "name": f"{profile.get('name')}'s Custom Plan", "data": json.dumps(db_json)})
-            
-        msg = AIMessage(content=f"I've successfully generated and saved your '{plan_data.goal}' plan! Check your Home tab to see the full breakdown.")
-    except Exception as e:
-        msg = AIMessage(content="I generated the plan, but hit a database error saving it. Please try again.")
-
+    plan_name = f"{state['user_profile'].get('name', 'My')} {plan_data.duration_weeks}-Week Plan"
+    
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE workout_plans SET is_active = false WHERE user_id = :uid"), {"uid": user_id})
+        query = text("""
+            INSERT INTO workout_plans (user_id, plan_name, plan_json, is_active)
+            VALUES (:uid, :name, :data, true)
+        """)
+        conn.execute(query, {"uid": user_id, "name": plan_name, "data": json.dumps(db_json)})
+        
+    # 3. Return conversational confirmation
+    msg = AIMessage(content=f"I've successfully generated your custom {plan_data.duration_weeks}-week '{plan_data.goal}' plan! Check your Home tab to see the breakdown.")
     return {"messages": [msg]}
 
-def normal_chat_node(state: AgentState):
-    """Standard RAG/Conversational response with full context."""
-    profile = state["user_profile"]
-    user_id = state["user_id"]
-    
-    # Fetch recent workouts for context
-    with engine.connect() as conn:
-        sessions_query = text("""
-            SELECT activity_key, reps, duration_seconds, form_score, dominant_deviation 
-            FROM workout_sessions 
-            WHERE user_id = :uid ORDER BY created_at DESC LIMIT 3
-        """)
-        session_rows = conn.execute(sessions_query, {"uid": user_id}).mappings().fetchall()
-        
-    workout_context = "No recent workouts recorded."
-    if session_rows:
-        summaries = [
-            f"- {s['activity_key'].capitalize()}: {s['reps']} reps, Score: {s['form_score']}%, Issue: {s['dominant_deviation'] or 'None'}"
-            for s in session_rows
-        ]
-        workout_context = "\n".join(summaries)
-
-    system_prompt = f"""You are CoachSaab, a smart AI fitness coach.
-    
-    Current User Profile:
-    - Name: {profile.get('name')}
-    - Gender: {profile.get('gender')}
-    - Age: {profile.get('age') or 'Not set'}
-    - Weight: {f"{profile.get('weight_kg')} kg" if profile.get('weight_kg') else 'Not set'}
-    - Goals: {', '.join(profile.get('goals', [])) if profile.get('goals') else 'Not set'}
-    - Preferences: {', '.join(profile.get('preferred_categories', [])) if profile.get('preferred_categories') else 'Not set'}
-
-    Recent Workouts:
-    {workout_context}
-
-    Keep responses brief, helpful, and action-oriented (1-3 sentences)."""
-    
-    messages = [SystemMessage(content=system_prompt)] + state["messages"][-6:]
-    response = llm.invoke(messages)
-    return {"messages": [response]}
-
-# ==========================================
-# 5. EDGE ROUTING LOGIC
-# ==========================================
-def route_intent(state: AgentState) -> str:
-    """Routes to plan generation or normal chat based on intent."""
-    if state["intent"] == "generate_plan":
-        # If they want a plan, check if the profile is complete first
-        if len(state["missing_fields"]) > 0:
-            return "ask_question"
-        return "generate_plan"
-    return "normal_chat"
-
-# ==========================================
-# 6. GRAPH COMPILATION
-# ==========================================
+# Compile the Graph
 graph_builder = StateGraph(AgentState)
-
-# Add Nodes
-graph_builder.add_node("load_user_state", load_user_state_node)
+graph_builder.add_node("load_state", load_state_node)
 graph_builder.add_node("extract_profile", extract_profile_node)
 graph_builder.add_node("update_database", update_database_node)
 graph_builder.add_node("determine_intent", determine_intent_node)
@@ -254,13 +207,10 @@ graph_builder.add_node("ask_question", ask_question_node)
 graph_builder.add_node("generate_plan", generate_plan_node)
 graph_builder.add_node("normal_chat", normal_chat_node)
 
-# Add Edges (The State Machine Flow)
-graph_builder.add_edge(START, "load_user_state")
-graph_builder.add_edge("load_user_state", "extract_profile")
+graph_builder.add_edge(START, "load_state")
+graph_builder.add_edge("load_state", "extract_profile")
 graph_builder.add_edge("extract_profile", "update_database")
 graph_builder.add_edge("update_database", "determine_intent")
-
-# Branch: Intent -> Plan (Complete vs Incomplete Profile) OR Chat
 graph_builder.add_conditional_edges("determine_intent", route_intent)
 graph_builder.add_edge("ask_question", END)
 graph_builder.add_edge("generate_plan", END)
@@ -269,11 +219,14 @@ graph_builder.add_edge("normal_chat", END)
 agent_graph = graph_builder.compile()
 
 # ==========================================
-# 7. FASTAPI ENDPOINTS
+# FASTAPI ENDPOINTS
 # ==========================================
 def clean_ai_response(text_content: str) -> str:
-    if not text_content: return "Hello!"
+    if not text_content:
+        return "I'm ready to help you train. What's our focus today?"
     cleaned = re.sub(r'<think>.*?</think>', '', text_content, flags=re.DOTALL | re.IGNORECASE)
+    cleaned = cleaned.replace("```json", "").replace("```markdown", "").replace("```", "")
+    cleaned = cleaned.replace("**", "").replace("*", "").replace("### ", "").replace("## ", "").replace("# ", "")
     return cleaned.strip()
 
 class ChatMessageCreate(BaseModel):
@@ -295,7 +248,8 @@ class UserCreate(BaseModel):
     goals: Optional[List[str]] = []
 
 @app.get("/")
-def read_root(): return {"message": "CoachSaab API (Deterministic Graph) Active 🚀"}
+def read_root():
+    return {"message": "CoachSaab API Active 🚀"}
 
 @app.post("/api/v1/users")
 def create_user(user: UserCreate):
@@ -313,14 +267,26 @@ def create_user(user: UserCreate):
 @app.post("/api/v1/chat/conversations")
 def create_conversation(user_id: str):
     with engine.begin() as conn:
-        result = conn.execute(text("INSERT INTO chatbot_conversations (user_id) VALUES (:user_id) RETURNING conversation_id"), {"user_id": user_id}).mappings().fetchone()
+        query = text("INSERT INTO chatbot_conversations (user_id) VALUES (:user_id) RETURNING conversation_id")
+        result = conn.execute(query, {"user_id": user_id}).mappings().fetchone()
         return dict(result)
 
 @app.get("/api/v1/chat/conversations/{conversation_id}/messages")
 def get_chat_history(conversation_id: str):
     with engine.connect() as conn:
-        rows = conn.execute(text("SELECT role, content, created_at FROM chatbot_messages WHERE conversation_id = :conv_id ORDER BY created_at ASC"), {"conv_id": conversation_id}).mappings().fetchall()
-        return [{"role": r["role"], "content": clean_ai_response(r["content"]) if r["role"] == "assistant" else r["content"]} for r in rows]
+        # Check if conversation exists first to prevent silent failures and foreign key errors
+        conv = conn.execute(text("SELECT 1 FROM chatbot_conversations WHERE conversation_id = :c"), {"c": conversation_id}).fetchone()
+        if not conv:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+            
+        query = text("""
+            SELECT role, content, created_at 
+            FROM chatbot_messages 
+            WHERE conversation_id = :conv_id 
+            ORDER BY created_at ASC
+        """)
+        rows = conn.execute(query, {"conv_id": conversation_id}).mappings().fetchall()
+        return [{"role": r["role"], "content": clean_ai_response(r["content"]) if r["role"] == "assistant" else r["content"], "created_at": r["created_at"]} for r in rows]
 
 @app.post("/api/v1/sessions")
 def save_workout_session(session: WorkoutSessionCreate):
@@ -342,41 +308,71 @@ def save_workout_session(session: WorkoutSessionCreate):
 @app.get("/api/v1/users/{user_id}/plan")
 def get_active_plan(user_id: str):
     with engine.connect() as conn:
-        row = conn.execute(text("SELECT plan_name, plan_json, created_at FROM workout_plans WHERE user_id = :uid AND is_active = true ORDER BY created_at DESC LIMIT 1"), {"uid": user_id}).mappings().fetchone()
-        return dict(row) if row else {"status": "no_active_plan"}
+        query = text("""
+            SELECT plan_name, plan_json, created_at 
+            FROM workout_plans 
+            WHERE user_id = :uid AND is_active = true 
+            ORDER BY created_at DESC LIMIT 1
+        """)
+        row = conn.execute(query, {"uid": user_id}).mappings().fetchone()
+        if row:
+            return dict(row)
+        return {"status": "no_active_plan"}
 
 @app.post("/api/v1/chat/conversations/{conversation_id}/messages")
 def add_chat_message(conversation_id: str, message: ChatMessageCreate):
+    # 1. Validate conversation OUTSIDE the try block so it properly returns a 404
+    with engine.begin() as conn:
+        conv_query = text("SELECT user_id FROM chatbot_conversations WHERE conversation_id = :conv_id")
+        conv_row = conn.execute(conv_query, {"conv_id": conversation_id}).mappings().fetchone()
+        if not conv_row:
+            raise HTTPException(status_code=404, detail="Conversation not found")
+        user_id = conv_row['user_id']
+
     try:
         with engine.begin() as conn:
-            conv_row = conn.execute(text("SELECT user_id FROM chatbot_conversations WHERE conversation_id = :conv_id"), {"conv_id": conversation_id}).mappings().fetchone()
-            if not conv_row: raise HTTPException(status_code=404, detail="Conversation not found")
-            user_id = conv_row['user_id']
-            
-            # Save User Message
-            conn.execute(text("INSERT INTO chatbot_messages (conversation_id, role, content) VALUES (:conv_id, 'user', :content)"), {"conv_id": conversation_id, "content": message.content})
-            
-            # Load History for Graph
-            history_rows = conn.execute(text("SELECT role, content FROM chatbot_messages WHERE conversation_id = :conv_id ORDER BY created_at ASC LIMIT 10"), {"conv_id": conversation_id}).mappings().fetchall()
-            
-        lg_messages = []
-        for row in history_rows:
-            if row['role'] == 'user': lg_messages.append(HumanMessage(content=row['content']))
-            elif row['role'] == 'assistant': lg_messages.append(AIMessage(content=row['content']))
+            # Insert incoming user message first
+            conn.execute(
+                text("INSERT INTO chatbot_messages (conversation_id, role, content) VALUES (:conv_id, 'user', :content)"),
+                {"conv_id": conversation_id, "content": message.content}
+            )
 
-        # RUN THE STATE MACHINE
-        initial_state = {"messages": lg_messages, "user_id": user_id, "missing_fields": []}
-        result = agent_graph.invoke(initial_state)
+            # Fetch chronological message history
+            history_query = text("""
+                SELECT role, content FROM chatbot_messages 
+                WHERE conversation_id = :conv_id 
+                ORDER BY created_at ASC
+            """)
+            history_rows = conn.execute(history_query, {"conv_id": conversation_id}).mappings().fetchall()
+
+            lg_messages = []
+            for row in history_rows:
+                if row['role'] == 'user':
+                    lg_messages.append(HumanMessage(content=row['content']))
+                elif row['role'] == 'assistant':
+                    lg_messages.append(AIMessage(content=row['content']))
+
+        # Invoke the Deterministic State Machine
+        initial_state = {
+            "messages": lg_messages,
+            "user_id": user_id
+        }
         
+        result = agent_graph.invoke(initial_state)
         raw_reply = result["messages"][-1].content
         ai_reply = clean_ai_response(raw_reply)
         
     except Exception as e:
-        print(f"Graph Error: {str(e)}")
-        ai_reply = "I ran into a temporary issue processing that. Let's try again!"
+        print(f"Backend Server Error: {str(e)}")
+        ai_reply = f"I ran into a temporary issue processing that. Let's try again!"
 
-    # Save Assistant Message
     with engine.begin() as conn:
-        result = conn.execute(text("INSERT INTO chatbot_messages (conversation_id, role, content) VALUES (:conv_id, 'assistant', :content) RETURNING message_id, role, content"), {"conv_id": conversation_id, "content": ai_reply}).mappings().fetchone()
+        insert_ai_msg = text("""
+            INSERT INTO chatbot_messages (conversation_id, role, content) 
+            VALUES (:conv_id, 'assistant', :content) RETURNING message_id, role, content
+        """)
+        result = conn.execute(insert_ai_msg, {"conv_id": conversation_id, "content": ai_reply}).mappings().fetchone()
         
-    return {"role": result["role"], "content": clean_ai_response(result["content"])}
+    response_dict = dict(result)
+    response_dict['content'] = clean_ai_response(response_dict['content'])
+    return response_dict
