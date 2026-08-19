@@ -1,10 +1,12 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import create_engine, text
-from typing import Optional, List, Annotated, Literal
+from typing import Optional, List, Annotated, Literal, Union
 import os
 import json
 import re
+import uuid
+import hashlib
 from dotenv import load_dotenv
 from typing_extensions import TypedDict
 from langgraph.graph import StateGraph, START, END
@@ -14,7 +16,7 @@ from langchain_groq import ChatGroq
 
 load_dotenv()
 
-app = FastAPI(title="CoachSaab API", version="6.0")
+app = FastAPI(title="CoachSaab API", version="6.1")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 engine = create_engine(DATABASE_URL)
@@ -27,10 +29,14 @@ llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.2)
 # ==========================================
 # PYDANTIC SCHEMAS
 # ==========================================
+class ScheduledExercise(BaseModel):
+    exercise_id: str
+    name: str
+
 class DailyWorkout(BaseModel):
     day_number: int = Field(..., description="Day of the week (1 to 7)")
     focus: str = Field(..., description="Workout focus (e.g., 'UPPER BODY', 'LOWER BODY', 'ACTIVE RECOVERY', 'REST DAY')")
-    exercises: List[str] = Field(..., description="List of exercises WITH sets, reps, or time included in the string. Example: ['Barbell Squat (3 sets x 10 reps)', 'Plank (60 seconds)']. Empty if rest day.")
+    exercises: List[ScheduledExercise] = Field(..., description="List of exercises, each with a stable exercise_id and a name string that includes sets/reps/time. Empty if rest day.")
     is_rest: bool = Field(..., description="True if this is a rest day")
 
 class WorkoutPlanSchema(BaseModel):
@@ -39,15 +45,142 @@ class WorkoutPlanSchema(BaseModel):
     notes: str = Field(..., description="Additional coaching advice and progression instructions")
     schedule: List[DailyWorkout] = Field(..., description="A 7-day schedule template (Days 1-7)")
 
+class DailyWorkoutDraft(BaseModel):
+    day_number: int
+    focus: str
+    exercises: List[str] = Field(default_factory=list)
+    is_rest: bool
+
+class WorkoutPlanDraftSchema(BaseModel):
+    duration_weeks: int = Field(..., gt=0, le=12)
+    goal: str
+    notes: str
+    schedule: List[DailyWorkoutDraft]
+
+# ==========================================
+# STABLE EXERCISE ID HELPERS
+# ==========================================
+def generate_exercise_id() -> str:
+    return uuid.uuid4().hex[:12]
+
+def generate_legacy_exercise_id(plan_id: str, day_number: int, exercise_index: int) -> str:
+    raw = f"{plan_id}:{day_number}:{exercise_index}"
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
+
+def assign_ids_to_draft_plan(draft: WorkoutPlanDraftSchema) -> dict:
+    schedule = []
+    for day in draft.schedule:
+        exercises = [
+            {"exercise_id": generate_exercise_id(), "name": name}
+            for name in day.exercises
+        ]
+        schedule.append({
+            "day_number": day.day_number,
+            "focus": day.focus,
+            "exercises": exercises,
+            "is_rest": day.is_rest,
+        })
+    return {
+        "duration_weeks": draft.duration_weeks,
+        "goal": draft.goal,
+        "notes": draft.notes,
+        "schedule": schedule,
+    }
+
+def normalize_plan_json(plan_json: dict, plan_id: str) -> tuple[dict, bool]:
+    if not plan_json or "schedule" not in plan_json:
+        return plan_json, False
+
+    changed = False
+    for day in plan_json.get("schedule", []):
+        day_number = day.get("day_number")
+        raw_exercises = day.get("exercises", []) or []
+        normalized_exercises = []
+        for idx, ex in enumerate(raw_exercises):
+            if isinstance(ex, str):
+                normalized_exercises.append({
+                    "exercise_id": generate_legacy_exercise_id(plan_id, day_number, idx),
+                    "name": ex,
+                })
+                changed = True
+            elif isinstance(ex, dict) and "exercise_id" in ex and "name" in ex:
+                normalized_exercises.append(ex)
+            else:
+                continue
+        day["exercises"] = normalized_exercises
+
+    return plan_json, changed
+
+# ==========================================
+# PLAN MODIFICATION SCHEMAS
+# ==========================================
+class AddExerciseOp(BaseModel):
+    type: Literal["add_exercise"]
+    day_number: int
+    name: str
+
+class RemoveExerciseOp(BaseModel):
+    type: Literal["remove_exercise"]
+    exercise_id: str
+
+class ReplaceExerciseOp(BaseModel):
+    type: Literal["replace_exercise"]
+    exercise_id: str
+    new_name: str
+
+class ModifyExerciseOp(BaseModel):
+    type: Literal["modify_exercise"]
+    exercise_id: str
+    new_name: str
+
+class ChangeDayFocusOp(BaseModel):
+    type: Literal["change_day_focus"]
+    day_number: int
+    new_focus: str
+
+class RestDayOp(BaseModel):
+    type: Literal["rest_day"]
+    day_number: int
+
+class ChangeDurationOp(BaseModel):
+    type: Literal["change_duration"]
+    new_duration_weeks: int = Field(..., gt=0, le=12)
+
+class RemoveExercisesByIdsOp(BaseModel):
+    type: Literal["remove_exercises_by_ids"]
+    exercise_ids: List[str]
+
+ModificationOperation = Union[
+    AddExerciseOp,
+    RemoveExerciseOp,
+    ReplaceExerciseOp,
+    ModifyExerciseOp,
+    ChangeDayFocusOp,
+    RestDayOp,
+    ChangeDurationOp,
+    RemoveExercisesByIdsOp,
+]
+
+class ModificationRequest(BaseModel):
+    operations: Optional[List[ModificationOperation]] = None
+    clarification_question: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _exactly_one_branch(self):
+        has_ops = bool(self.operations)
+        has_clarification = bool(self.clarification_question)
+        if has_ops == has_clarification:
+            raise ValueError(
+                "ModificationRequest must have EITHER operations OR clarification_question, not both/neither."
+            )
+        return self
+
 # ==========================================
 # HELPER: ROBUST JSON PARSER
 # ==========================================
 def extract_json_from_text(text_content: str) -> dict:
-    """Strips <think> tags, markdown, and extracts the first valid JSON object."""
     try:
-        # Strip <think> tags
         cleaned = re.sub(r'<think>.*?</think>', '', text_content, flags=re.DOTALL | re.IGNORECASE)
-        # Find everything between first { and last }
         start_idx = cleaned.find('{')
         end_idx = cleaned.rfind('}')
         if start_idx != -1 and end_idx != -1:
@@ -77,10 +210,12 @@ class AgentState(TypedDict):
     user_profile: dict
     missing_fields: list
     extracted_updates: dict
-    intent: str # "chat" or "onboarding"
+    intent: str
+    active_plan: Optional[dict]
+    modification_result: Optional[dict]
+    modification_error: Optional[str]
 
 def load_state_node(state: AgentState):
-    """Loads profile from DB and calculates missing fields deterministically."""
     user_id = state["user_id"]
     with engine.connect() as conn:
         user_row = conn.execute(
@@ -103,29 +238,88 @@ def load_state_node(state: AgentState):
 
     return {"user_profile": profile, "missing_fields": missing}
 
+MODIFICATION_VERBS = [
+    "remove", "delete", "replace", "swap", "substitute",
+    "add", "modify", "update", "change",
+]
+PLAN_REFERENCE_TERMS = [
+    "plan", "exercise", "workout", "routine", "schedule",
+    "sets", "reps", "rest day", "duration",
+]
+INJURY_TERMS = [
+    "injury", "injured", "hurt", "pain", "sore",
+    "can't train", "cannot train", "unable to train",
+    "don't have access to", "only have",
+]
+
+def _mentions_day_or_week_reference(text_lower: str) -> bool:
+    return bool(re.search(r"\b(day|week)\s*\d+\b", text_lower))
+
+def load_active_plan_node(state: AgentState):
+    user_id = state["user_id"]
+    with engine.connect() as conn:
+        row = conn.execute(
+            text("""
+                SELECT plan_id, plan_json
+                FROM workout_plans
+                WHERE user_id = :uid AND is_active = true
+                ORDER BY created_at DESC LIMIT 1
+            """),
+            {"uid": user_id}
+        ).mappings().fetchone()
+
+    if not row:
+        return {"active_plan": None}
+
+    plan_id = str(row["plan_id"])
+    plan_json = row["plan_json"]
+    if isinstance(plan_json, str):
+        plan_json = json.loads(plan_json)
+
+    normalized_json, changed = normalize_plan_json(plan_json, plan_id)
+
+    if changed:
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("UPDATE workout_plans SET plan_json = :data WHERE plan_id = :pid"),
+                    {"data": json.dumps(normalized_json), "pid": plan_id}
+                )
+        except Exception as e:
+            print(f"Legacy plan normalization persist error: {str(e)}")
+
+    return {"active_plan": {"plan_id": plan_id, "plan_json": normalized_json}}
+
 def determine_intent_node(state: AgentState):
-    """DETERMINISTIC ROUTER: No LLM used here. Checks chat history for intent."""
     latest_user_msg = state["messages"][-1].content.lower()
-    
-    # 1. Did the AI just ask an onboarding question?
+    has_active_plan = bool(state.get("active_plan"))
+
     ai_asked_question = False
     if len(state["messages"]) >= 2:
         last_ai_msg = state["messages"][-2].content
         if any(q in last_ai_msg for q in QUESTIONS.values()):
             ai_asked_question = True
 
-    # 2. Did the user explicitly trigger a plan request?
     plan_triggers = ["plan", "routine", "program", "schedule", "workout"]
     user_wants_plan = any(t in latest_user_msg for t in plan_triggers)
 
-    # If the user wants a plan, or is currently answering an onboarding question, route to extraction
+    if has_active_plan:
+        has_mod_verb = any(v in latest_user_msg for v in MODIFICATION_VERBS)
+        has_plan_ref = (
+            any(t in latest_user_msg for t in PLAN_REFERENCE_TERMS)
+            or _mentions_day_or_week_reference(latest_user_msg)
+        )
+        has_injury_language = any(t in latest_user_msg for t in INJURY_TERMS)
+
+        if (has_mod_verb and has_plan_ref) or has_injury_language:
+            return {"intent": "modification"}
+
     if ai_asked_question or user_wants_plan:
         return {"intent": "onboarding"}
     
     return {"intent": "chat"}
 
 def extract_profile_node(state: AgentState):
-    """Uses LLM only for semantic extraction (and inferring numbers)."""
     try:
         latest_msg = state["messages"][-1].content
         missing_context = ", ".join(state.get("missing_fields", []))
@@ -152,10 +346,9 @@ def extract_profile_node(state: AgentState):
         return {"extracted_updates": {}}
 
 def update_database_node(state: AgentState):
-    """Merges new extractions into DB. If no updates, state remains unchanged."""
     updates = state.get("extracted_updates", {})
     if not updates:
-        return load_state_node(state) # Reload state to check if we should ask the next question
+        return load_state_node(state)
     
     user_id = state["user_id"]
     profile = state["user_profile"]
@@ -193,7 +386,6 @@ def update_database_node(state: AgentState):
     return load_state_node(state)
 
 def ask_question_node(state: AgentState):
-    """DETERMINISTIC: Outputs a hardcoded question. No LLM used."""
     missing = state.get("missing_fields", [])
     target_field = missing[0] if missing else "Age"
     return {"messages": [AIMessage(content=QUESTIONS[target_field])]}
@@ -209,10 +401,9 @@ def normal_chat_node(state: AgentState):
     return {"messages": [response]}
 
 def generate_plan_node(state: AgentState):
-    """Generates the plan and uses robust JSON parsing to bypass <think> tags."""
     try:
         profile_str = json.dumps(state["user_profile"])
-        schema_json = WorkoutPlanSchema.model_json_schema()
+        schema_json = WorkoutPlanDraftSchema.model_json_schema()
         
         sys_prompt = f"""Create a highly effective custom workout plan for this user. 
         User Profile: {profile_str}
@@ -233,13 +424,13 @@ def generate_plan_node(state: AgentState):
         if not extracted_json:
              return {"messages": [AIMessage(content="I'm having a little trouble formulating the perfect routine right now. Let's try again!")]}
              
-        plan_data = WorkoutPlanSchema.model_validate(extracted_json)
-        
-        user_id = state["user_id"]
-        db_json = plan_data.model_dump()
+        draft_plan = WorkoutPlanDraftSchema.model_validate(extracted_json)
+
+        db_json = assign_ids_to_draft_plan(draft_plan)
         db_json["status"] = "active"
         
-        plan_name = f"{state['user_profile'].get('name', 'My')} {plan_data.duration_weeks}-Week Plan"
+        user_id = state["user_id"]
+        plan_name = f"{state['user_profile'].get('name', 'My')} {draft_plan.duration_weeks}-Week Plan"
         
         with engine.begin() as conn:
             conn.execute(text("UPDATE workout_plans SET is_active = false WHERE user_id = :uid"), {"uid": user_id})
@@ -249,18 +440,254 @@ def generate_plan_node(state: AgentState):
             """)
             conn.execute(query, {"uid": user_id, "name": plan_name, "data": json.dumps(db_json)})
             
-        msg = AIMessage(content=f"I've successfully generated your custom {plan_data.duration_weeks}-week '{plan_data.goal}' plan! Check your Home tab to see the breakdown.")
+        msg = AIMessage(content=f"I've successfully generated your custom {draft_plan.duration_weeks}-week '{draft_plan.goal}' plan! Check your Home tab to see the breakdown.")
         return {"messages": [msg]}
     except Exception as e:
         print(f"Plan Gen Error: {str(e)}")
         return {"messages": [AIMessage(content=f"SYSTEM ERROR: {str(e)}")]}
 
+def _render_plan_for_llm(plan_json: dict) -> str:
+    lines = []
+    for day in plan_json.get("schedule", []):
+        lines.append(f"Day {day.get('day_number')} ({day.get('focus')}):")
+        if day.get("is_rest") or not day.get("exercises"):
+            lines.append("  (rest day / no exercises)")
+        for ex in day.get("exercises", []):
+            lines.append(f"  [{ex['exercise_id']}] {ex['name']}")
+    return "\n".join(lines)
+
+def extract_modification_node(state: AgentState):
+    try:
+        active_plan = state.get("active_plan")
+        if not active_plan:
+            return {"modification_error": "no_active_plan"}
+
+        plan_repr = _render_plan_for_llm(active_plan["plan_json"])
+        latest_msg = state["messages"][-1].content
+        schema_json = ModificationRequest.model_json_schema()
+
+        sys_prompt = f"""You are a precise workout-plan modification extractor.
+
+ACTIVE PLAN (the ONLY valid exercise_ids and day_numbers you may reference):
+{plan_repr}
+
+USER REQUEST:
+"{latest_msg}"
+
+RULES:
+1. Return ONLY a JSON object matching this schema: {json.dumps(schema_json)}
+2. You MUST use `operations` OR `clarification_question`, never both.
+3. NEVER invent an exercise_id. Only use IDs shown above, exactly as written.
+4. For remove/replace/modify operations, reference the exercise by its exercise_id, not by name.
+5. If the request is ambiguous, return a `clarification_question` instead of guessing.
+6. Do NOT diagnose any injury. Only extract what the user explicitly asked to change.
+7. For add_exercise, you do not need to invent an exercise_id - the backend assigns it.
+8. Do not include <think> tags in the final JSON.
+"""
+
+        response = llm.invoke([
+            SystemMessage(content=sys_prompt),
+            HumanMessage(content="Extract the modification. Output pure JSON.")
+        ])
+
+        extracted_json = extract_json_from_text(response.content)
+        if not extracted_json:
+            return {"modification_error": "extraction_failed"}
+
+        mod_request = ModificationRequest.model_validate(extracted_json)
+        return {"modification_result": mod_request.model_dump(exclude_none=True), "modification_error": None}
+    except Exception as e:
+        print(f"Modification Extraction Error: {str(e)}")
+        return {"modification_error": "extraction_failed"}
+
+def _validate_operations(operations: list, plan_json: dict) -> Optional[str]:
+    valid_ids = {
+        ex["exercise_id"]
+        for day in plan_json.get("schedule", [])
+        for ex in day.get("exercises", [])
+    }
+    valid_days = {day.get("day_number") for day in plan_json.get("schedule", [])}
+
+    for op in operations:
+        op_type = op.get("type")
+
+        if op_type == "add_exercise":
+            if op.get("day_number") not in valid_days:
+                return f"Invalid day_number in add_exercise: {op.get('day_number')}"
+            if not op.get("name"):
+                return "add_exercise missing exercise name"
+
+        elif op_type in ("remove_exercise", "replace_exercise", "modify_exercise"):
+            if op.get("exercise_id") not in valid_ids:
+                return f"Unknown exercise_id: {op.get('exercise_id')}"
+            if op_type in ("replace_exercise", "modify_exercise") and not op.get("new_name"):
+                return f"{op_type} missing new_name"
+
+        elif op_type == "remove_exercises_by_ids":
+            ids = op.get("exercise_ids") or []
+            if not ids:
+                return "remove_exercises_by_ids missing exercise_ids"
+            for eid in ids:
+                if eid not in valid_ids:
+                    return f"Unknown exercise_id: {eid}"
+
+        elif op_type == "change_day_focus":
+            if op.get("day_number") not in valid_days:
+                return f"Invalid day_number in change_day_focus: {op.get('day_number')}"
+            if not op.get("new_focus"):
+                return "change_day_focus missing new_focus"
+
+        elif op_type == "rest_day":
+            if op.get("day_number") not in valid_days:
+                return f"Invalid day_number in rest_day: {op.get('day_number')}"
+
+        elif op_type == "change_duration":
+            weeks = op.get("new_duration_weeks")
+            if not isinstance(weeks, int) or weeks <= 0 or weeks > 12:
+                return f"Invalid new_duration_weeks: {weeks}"
+
+        else:
+            return f"Unknown operation type: {op_type}"
+
+    return None
+
+def _apply_operations(operations: list, plan_json: dict) -> tuple[dict, set]:
+    days_by_number = {day["day_number"]: day for day in plan_json.get("schedule", [])}
+    affected_days = set()
+
+    for op in operations:
+        op_type = op["type"]
+
+        if op_type == "add_exercise":
+            day = days_by_number[op["day_number"]]
+            day.setdefault("exercises", []).append({
+                "exercise_id": generate_exercise_id(),
+                "name": op["name"],
+            })
+            day["is_rest"] = False
+            affected_days.add(op["day_number"])
+
+        elif op_type == "remove_exercise":
+            target_id = op["exercise_id"]
+            for day in plan_json.get("schedule", []):
+                before = len(day.get("exercises", []))
+                day["exercises"] = [ex for ex in day.get("exercises", []) if ex["exercise_id"] != target_id]
+                if len(day["exercises"]) != before:
+                    affected_days.add(day["day_number"])
+
+        elif op_type == "remove_exercises_by_ids":
+            target_ids = set(op["exercise_ids"])
+            for day in plan_json.get("schedule", []):
+                before = len(day.get("exercises", []))
+                day["exercises"] = [ex for ex in day.get("exercises", []) if ex["exercise_id"] not in target_ids]
+                if len(day["exercises"]) != before:
+                    affected_days.add(day["day_number"])
+
+        elif op_type == "replace_exercise":
+            target_id = op["exercise_id"]
+            for day in plan_json.get("schedule", []):
+                for ex in day.get("exercises", []):
+                    if ex["exercise_id"] == target_id:
+                        ex["name"] = op["new_name"]
+                        affected_days.add(day["day_number"])
+
+        elif op_type == "modify_exercise":
+            target_id = op["exercise_id"]
+            for day in plan_json.get("schedule", []):
+                for ex in day.get("exercises", []):
+                    if ex["exercise_id"] == target_id:
+                        ex["name"] = op["new_name"]
+                        affected_days.add(day["day_number"])
+
+        elif op_type == "rest_day":
+            day = days_by_number[op["day_number"]]
+            day["exercises"] = []
+            day["is_rest"] = True
+            day["focus"] = "REST DAY"
+            affected_days.add(op["day_number"])
+
+        elif op_type == "change_day_focus":
+            day = days_by_number[op["day_number"]]
+            day["focus"] = op["new_focus"]
+
+        elif op_type == "change_duration":
+            plan_json["duration_weeks"] = op["new_duration_weeks"]
+
+    return plan_json, affected_days
+
+def apply_modification_node(state: AgentState):
+    try:
+        active_plan = state.get("active_plan")
+        mod_result = state.get("modification_result") or {}
+        operations = mod_result.get("operations")
+
+        if not active_plan or not operations:
+            return {"messages": [AIMessage(content="I couldn't find an active plan to modify.")]}
+
+        plan_id = active_plan["plan_id"]
+        user_id = state["user_id"]
+
+        with engine.connect() as conn:
+            owner_check = conn.execute(
+                text("SELECT 1 FROM workout_plans WHERE plan_id = :pid AND user_id = :uid AND is_active = true"),
+                {"pid": plan_id, "uid": user_id}
+            ).fetchone()
+        if not owner_check:
+            return {"messages": [AIMessage(content="I couldn't verify that plan belongs to you, so no changes were made.")]}
+
+        plan_json = json.loads(json.dumps(active_plan["plan_json"]))
+
+        validation_error = _validate_operations(operations, plan_json)
+        if validation_error:
+            print(f"Modification validation failed, applying NONE: {validation_error}")
+            return {"messages": [AIMessage(content="I couldn't safely apply that change, so nothing was modified. Could you clarify what you'd like changed?")]}
+
+        new_plan_json, affected_days = _apply_operations(operations, plan_json)
+
+        try:
+            with engine.begin() as conn:
+                conn.execute(
+                    text("UPDATE workout_plans SET plan_json = :data WHERE plan_id = :pid AND user_id = :uid"),
+                    {"data": json.dumps(new_plan_json), "pid": plan_id, "uid": user_id}
+                )
+                for day_number in affected_days:
+                    conn.execute(
+                        text("DELETE FROM plan_day_completions WHERE plan_id = :pid AND day_number = :dn"),
+                        {"pid": plan_id, "dn": day_number}
+                    )
+        except Exception as e:
+            print(f"Modification transaction failed: {str(e)}")
+            return {"messages": [AIMessage(content="Something went wrong while saving your changes. Please try again.")]}
+
+        reply = "Done! I've updated your workout plan."
+        if affected_days:
+            reply += f" Progress for day(s) {', '.join(str(d) for d in sorted(affected_days))} was reset since those exercises changed."
+
+        latest_user_msg = state["messages"][-1].content.lower()
+        if any(t in latest_user_msg for t in INJURY_TERMS):
+            reply += " I can adjust your workout to avoid uncomfortable movements. If pain is significant, please consult a professional."
+
+        return {"messages": [AIMessage(content=reply)]}
+    except Exception as e:
+        print(f"Apply Modification Error: {str(e)}")
+        return {"messages": [AIMessage(content="Something went wrong while modifying your plan. Please try again.")]}
+
+def clarify_modification_node(state: AgentState):
+    mod_result = state.get("modification_result") or {}
+    question = mod_result.get("clarification_question")
+    if not question:
+        question = "I wasn't able to understand exactly what you'd like changed. Could you rephrase that?"
+    return {"messages": [AIMessage(content=question)]}
+
 # ==========================================
 # GRAPH ROUTING
 # ==========================================
 def route_intent(state: AgentState) -> str:
-    if state.get("intent") == "onboarding":
+    intent = state.get("intent")
+    if intent == "onboarding":
         return "extract_profile"
+    if intent == "modification":
+        return "extract_modification"
     return "normal_chat"
 
 def route_after_update(state: AgentState) -> str:
@@ -268,24 +695,38 @@ def route_after_update(state: AgentState) -> str:
         return "ask_question"
     return "generate_plan"
 
+def route_after_modification_extraction(state: AgentState) -> str:
+    mod_result = state.get("modification_result") or {}
+    if mod_result.get("clarification_question") or state.get("modification_error"):
+        return "clarify_modification"
+    return "apply_modification"
+
 # Compile the Graph
 graph_builder = StateGraph(AgentState)
 graph_builder.add_node("load_state", load_state_node)
+graph_builder.add_node("load_active_plan", load_active_plan_node)
 graph_builder.add_node("determine_intent", determine_intent_node)
 graph_builder.add_node("extract_profile", extract_profile_node)
 graph_builder.add_node("update_database", update_database_node)
 graph_builder.add_node("ask_question", ask_question_node)
 graph_builder.add_node("generate_plan", generate_plan_node)
 graph_builder.add_node("normal_chat", normal_chat_node)
+graph_builder.add_node("extract_modification", extract_modification_node)
+graph_builder.add_node("clarify_modification", clarify_modification_node)
+graph_builder.add_node("apply_modification", apply_modification_node)
 
 graph_builder.add_edge(START, "load_state")
-graph_builder.add_edge("load_state", "determine_intent")
+graph_builder.add_edge("load_state", "load_active_plan")
+graph_builder.add_edge("load_active_plan", "determine_intent")
 graph_builder.add_conditional_edges("determine_intent", route_intent)
 graph_builder.add_edge("extract_profile", "update_database")
 graph_builder.add_conditional_edges("update_database", route_after_update)
 graph_builder.add_edge("ask_question", END)
 graph_builder.add_edge("generate_plan", END)
 graph_builder.add_edge("normal_chat", END)
+graph_builder.add_conditional_edges("extract_modification", route_after_modification_extraction)
+graph_builder.add_edge("clarify_modification", END)
+graph_builder.add_edge("apply_modification", END)
 
 agent_graph = graph_builder.compile()
 
@@ -408,7 +849,6 @@ def get_plan_completions(plan_id: str):
 @app.post("/api/v1/plans/{plan_id}/completions/toggle")
 def toggle_plan_completion(plan_id: str, payload: DayCompletionToggle):
     with engine.begin() as conn:
-        # SECURITY PATCH: Verify the user actually owns this plan!
         plan_check = conn.execute(
             text("SELECT 1 FROM workout_plans WHERE plan_id = :pid AND user_id = :uid"),
             {"pid": plan_id, "uid": payload.user_id}
@@ -474,7 +914,10 @@ def add_chat_message(conversation_id: str, message: ChatMessageCreate):
             "user_profile": {},
             "missing_fields": [],
             "extracted_updates": {},
-            "intent": "chat"
+            "intent": "chat",
+            "active_plan": None,
+            "modification_result": None,
+            "modification_error": None,
         }
         
         result = agent_graph.invoke(initial_state)
