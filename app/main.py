@@ -14,7 +14,7 @@ from langchain_groq import ChatGroq
 
 load_dotenv()
 
-app = FastAPI(title="CoachSaab API", version="5.2")
+app = FastAPI(title="CoachSaab API", version="6.0")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 engine = create_engine(DATABASE_URL)
@@ -37,18 +37,36 @@ class WorkoutPlanSchema(BaseModel):
     duration_weeks: int = Field(..., gt=0, le=12, description="Duration in weeks. Keep it short (2 to 4 weeks max) for quick user milestones, unless the user explicitly requested a longer plan.")
     goal: str = Field(..., description="Main objective of the plan")
     notes: str = Field(..., description="Additional coaching advice and progression instructions")
-    schedule: List[DailyWorkout] = Field(..., description="A 7-day schedule template (Days 1-7) that repeats each week")
+    schedule: List[DailyWorkout] = Field(..., description="A 7-day schedule template (Days 1-7)")
 
 # ==========================================
-# AGENT TOOLS
-class ProfileExtractionSchema(BaseModel):
-    age: Optional[int] = Field(None, description="Extracted age")
-    weight_kg: Optional[float] = Field(None, description="Extracted weight in kg")
-    goals: Optional[List[str]] = Field(None, description="Extracted fitness goals")
-    preferred_categories: Optional[List[str]] = Field(None, description="Extracted preferred exercise types")
+# HELPER: ROBUST JSON PARSER
+# ==========================================
+def extract_json_from_text(text_content: str) -> dict:
+    """Strips <think> tags, markdown, and extracts the first valid JSON object."""
+    try:
+        # Strip <think> tags
+        cleaned = re.sub(r'<think>.*?</think>', '', text_content, flags=re.DOTALL | re.IGNORECASE)
+        # Find everything between first { and last }
+        start_idx = cleaned.find('{')
+        end_idx = cleaned.rfind('}')
+        if start_idx != -1 and end_idx != -1:
+            json_str = cleaned[start_idx:end_idx+1]
+            return json.loads(json_str)
+        return {}
+    except Exception as e:
+        print(f"JSON Parsing Error: {e}")
+        return {}
 
-class IntentSchema(BaseModel):
-    intent: Literal["chat", "plan"] = Field(description="Is the user asking for a workout plan/routine ('plan') or just having a conversation ('chat')?")
+# ==========================================
+# DETERMINISTIC ONBOARDING QUESTIONS
+# ==========================================
+QUESTIONS = {
+    "Age": "Could you please let me know your age?",
+    "Weight (kg)": "Could you please tell me your current weight in kilograms?",
+    "Fitness Goals": "What are your main fitness goals right now? (e.g., lose fat, build muscle, improve endurance)",
+    "Preferred Exercises": "What types of exercises or equipment do you prefer? (e.g., bodyweight, dumbbells, running, home workouts)"
+}
 
 # ==========================================
 # LANGGRAPH STATE & NODES (Deterministic Flow)
@@ -59,10 +77,10 @@ class AgentState(TypedDict):
     user_profile: dict
     missing_fields: list
     extracted_updates: dict
-    intent: str
+    intent: str # "chat" or "onboarding"
 
 def load_state_node(state: AgentState):
-    """Loads the user's current profile from the database and calculates missing fields."""
+    """Loads profile from DB and calculates missing fields deterministically."""
     user_id = state["user_id"]
     with engine.connect() as conn:
         user_row = conn.execute(
@@ -74,7 +92,6 @@ def load_state_node(state: AgentState):
         return {"user_profile": {}, "missing_fields": ["Profile Error"]}
 
     profile = dict(user_row)
-    
     if profile.get("weight_kg") is not None:
         profile["weight_kg"] = float(profile["weight_kg"])
 
@@ -86,30 +103,59 @@ def load_state_node(state: AgentState):
 
     return {"user_profile": profile, "missing_fields": missing}
 
+def determine_intent_node(state: AgentState):
+    """DETERMINISTIC ROUTER: No LLM used here. Checks chat history for intent."""
+    latest_user_msg = state["messages"][-1].content.lower()
+    
+    # 1. Did the AI just ask an onboarding question?
+    ai_asked_question = False
+    if len(state["messages"]) >= 2:
+        last_ai_msg = state["messages"][-2].content
+        if any(q in last_ai_msg for q in QUESTIONS.values()):
+            ai_asked_question = True
+
+    # 2. Did the user explicitly trigger a plan request?
+    plan_triggers = ["plan", "routine", "program", "schedule", "workout"]
+    user_wants_plan = any(t in latest_user_msg for t in plan_triggers)
+
+    # If the user wants a plan, or is currently answering an onboarding question, route to extraction
+    if ai_asked_question or user_wants_plan:
+        return {"intent": "onboarding"}
+    
+    return {"intent": "chat"}
+
 def extract_profile_node(state: AgentState):
-    """Passively extracts any profile data mentioned in the latest user message."""
+    """Uses LLM only for semantic extraction (and inferring numbers)."""
     try:
         latest_msg = state["messages"][-1].content
-        extractor = llm.with_structured_output(ProfileExtractionSchema)
-        
         missing_context = ", ".join(state.get("missing_fields", []))
-        sys_prompt = f"Extract age, weight, goals, or exercise preferences. User is currently missing: {missing_context}. YOU MUST OUTPUT A VALID JSON TOOL CALL. DO NOT respond with conversational text."
         
-        extracted = extractor.invoke([
+        sys_prompt = f"""You are a strict data extractor. Extract profile data from the user's message.
+        User is currently missing these fields: {missing_context}. 
+        (CRITICAL: Use the missing fields to infer ambiguous numbers! If age is known but weight is missing, '75' means weight_kg).
+        
+        Respond ONLY with a valid JSON object containing these keys: 'age' (int), 'weight_kg' (float), 'goals' (list of str), 'preferred_categories' (list of str).
+        Omit keys if data is not present. Do not include <think> tags in the final JSON."""
+        
+        response = llm.invoke([
             SystemMessage(content=sys_prompt),
             HumanMessage(content=latest_msg)
         ])
-        updates = extracted.model_dump(exclude_none=True) if extracted else {}
+        
+        extracted = extract_json_from_text(response.content)
+        valid_keys = {"age", "weight_kg", "goals", "preferred_categories"}
+        updates = {k: v for k, v in extracted.items() if k in valid_keys and v is not None}
+        
         return {"extracted_updates": updates}
     except Exception as e:
         print(f"Extraction Error: {str(e)}")
         return {"extracted_updates": {}}
 
 def update_database_node(state: AgentState):
-    """Merges new profile extractions into the database (arrays are appended)."""
+    """Merges new extractions into DB. If no updates, state remains unchanged."""
     updates = state.get("extracted_updates", {})
     if not updates:
-        return {} 
+        return load_state_node(state) # Reload state to check if we should ask the next question
     
     user_id = state["user_id"]
     profile = state["user_profile"]
@@ -146,45 +192,11 @@ def update_database_node(state: AgentState):
                 
     return load_state_node(state)
 
-def determine_intent_node(state: AgentState):
-    """Determines if the user wants a plan or is just chatting."""
-    try:
-        recent_msgs = state["messages"][-4:]
-        context_str = "\n".join([f"{'User' if m.type == 'human' else 'AI'}: {m.content}" for m in recent_msgs])
-        
-        intent_analyzer = llm.with_structured_output(IntentSchema)
-        result = intent_analyzer.invoke([
-            SystemMessage(content=(
-                "Analyze the recent conversation. Is the user's overarching goal right now to generate a workout plan? "
-                "If they previously asked for a plan and are now answering profile questions (age, weight, goals), intent is still 'plan'. "
-                "Otherwise, intent is 'chat'."
-            )),
-            HumanMessage(content=f"Recent Conversation:\n{context_str}")
-        ])
-        intent_val = result.intent if result else "chat"
-        return {"intent": intent_val}
-    except Exception as e:
-        print(f"Intent Error: {str(e)}")
-        return {"intent": "chat"}
-
-def route_intent(state: AgentState) -> str:
-    intent = state.get("intent", "chat")
-    missing = state.get("missing_fields", [])
-    
-    if intent == "plan":
-        if missing:
-            return "ask_question"
-        else:
-            return "generate_plan"
-    return "normal_chat"
-
 def ask_question_node(state: AgentState):
+    """DETERMINISTIC: Outputs a hardcoded question. No LLM used."""
     missing = state.get("missing_fields", [])
-    target_field = missing[0] if missing else "information"
-    
-    prompt = f"The user wants a workout plan, but we are missing: {target_field}. Ask them for this specific field politely in 1 short sentence."
-    response = llm.invoke([SystemMessage(content=prompt)])
-    return {"messages": [response]}
+    target_field = missing[0] if missing else "Age"
+    return {"messages": [AIMessage(content=QUESTIONS[target_field])]}
 
 def normal_chat_node(state: AgentState):
     profile_str = json.dumps(state["user_profile"])
@@ -197,29 +209,31 @@ def normal_chat_node(state: AgentState):
     return {"messages": [response]}
 
 def generate_plan_node(state: AgentState):
-    """Forces the LLM to output a strict JSON plan, saves to DB, and returns confirmation."""
+    """Generates the plan and uses robust JSON parsing to bypass <think> tags."""
     try:
         profile_str = json.dumps(state["user_profile"])
-        plan_generator = llm.with_structured_output(WorkoutPlanSchema)
+        schema_json = WorkoutPlanSchema.model_json_schema()
         
-        # STRICT SYSTEM PROMPT UPDATE for formatting
         sys_prompt = f"""Create a highly effective custom workout plan for this user. 
         User Profile: {profile_str}
+        
         CRITICAL RULES:
-        1. Limit the plan duration to 2, 3, or 4 weeks MAX (unless user specifically asked for longer). We want quick, achievable milestones.
-        2. In the `exercises` list, you MUST include the exact sets and reps OR time duration in the string itself. 
-           Example Good: "Barbell Back Squat (3 sets x 10 reps)"
-           Example Good: "Plank (60 seconds)"
-           Example Bad: "Barbell Back Squat"
+        1. Limit the plan duration to 2, 3, or 4 weeks MAX (unless user specifically asked for longer). We want quick milestones.
+        2. In the `exercises` list, you MUST include the exact sets and reps OR time duration in the string itself (e.g., 'Barbell Back Squat (3 sets x 10 reps)').
+        3. You MUST respond ONLY with a valid JSON object that strictly matches this JSON schema:
+        {json.dumps(schema_json)}
         """
         
-        plan_data = plan_generator.invoke([
+        response = llm.invoke([
             SystemMessage(content=sys_prompt),
-            HumanMessage(content="Generate my plan based on my profile.")
+            HumanMessage(content="Generate my plan based on my profile. Output pure JSON.")
         ])
         
-        if not plan_data:
-            return {"messages": [AIMessage(content="I'm having a little trouble formulating the perfect routine right now. Let's try again!")]}
+        extracted_json = extract_json_from_text(response.content)
+        if not extracted_json:
+             return {"messages": [AIMessage(content="I'm having a little trouble formulating the perfect routine right now. Let's try again!")]}
+             
+        plan_data = WorkoutPlanSchema.model_validate(extracted_json)
         
         user_id = state["user_id"]
         db_json = plan_data.model_dump()
@@ -239,23 +253,36 @@ def generate_plan_node(state: AgentState):
         return {"messages": [msg]}
     except Exception as e:
         print(f"Plan Gen Error: {str(e)}")
-        return {"messages": [AIMessage(content=f"Uh oh! I ran into an error generating your plan: {str(e)}")]}
+        return {"messages": [AIMessage(content=f"SYSTEM ERROR: {str(e)}")]}
+
+# ==========================================
+# GRAPH ROUTING
+# ==========================================
+def route_intent(state: AgentState) -> str:
+    if state.get("intent") == "onboarding":
+        return "extract_profile"
+    return "normal_chat"
+
+def route_after_update(state: AgentState) -> str:
+    if state.get("missing_fields"):
+        return "ask_question"
+    return "generate_plan"
 
 # Compile the Graph
 graph_builder = StateGraph(AgentState)
 graph_builder.add_node("load_state", load_state_node)
+graph_builder.add_node("determine_intent", determine_intent_node)
 graph_builder.add_node("extract_profile", extract_profile_node)
 graph_builder.add_node("update_database", update_database_node)
-graph_builder.add_node("determine_intent", determine_intent_node)
 graph_builder.add_node("ask_question", ask_question_node)
 graph_builder.add_node("generate_plan", generate_plan_node)
 graph_builder.add_node("normal_chat", normal_chat_node)
 
 graph_builder.add_edge(START, "load_state")
-graph_builder.add_edge("load_state", "extract_profile")
-graph_builder.add_edge("extract_profile", "update_database")
-graph_builder.add_edge("update_database", "determine_intent")
+graph_builder.add_edge("load_state", "determine_intent")
 graph_builder.add_conditional_edges("determine_intent", route_intent)
+graph_builder.add_edge("extract_profile", "update_database")
+graph_builder.add_conditional_edges("update_database", route_after_update)
 graph_builder.add_edge("ask_question", END)
 graph_builder.add_edge("generate_plan", END)
 graph_builder.add_edge("normal_chat", END)
@@ -365,7 +392,6 @@ def get_active_plan(user_id: str):
         """)
         row = conn.execute(query, {"uid": user_id}).mappings().fetchone()
         if row:
-            # Convert UUIDs to strings for safe JSON serialization
             result_dict = dict(row)
             result_dict['plan_id'] = str(result_dict['plan_id'])
             result_dict['user_id'] = str(result_dict['user_id'])
@@ -377,14 +403,21 @@ def get_plan_completions(plan_id: str):
     with engine.connect() as conn:
         query = text("SELECT week_number, day_number FROM plan_day_completions WHERE plan_id = :pid AND is_completed = true")
         rows = conn.execute(query, {"pid": plan_id}).mappings().fetchall()
-        # Return format exactly as expected by Flutter UI: ['w1_d1', 'w2_d3', ...]
         return [f"w{r['week_number']}_d{r['day_number']}" for r in rows]
 
 @app.post("/api/v1/plans/{plan_id}/completions/toggle")
 def toggle_plan_completion(plan_id: str, payload: DayCompletionToggle):
     with engine.begin() as conn:
+        # SECURITY PATCH: Verify the user actually owns this plan!
+        plan_check = conn.execute(
+            text("SELECT 1 FROM workout_plans WHERE plan_id = :pid AND user_id = :uid"),
+            {"pid": plan_id, "uid": payload.user_id}
+        ).fetchone()
+        
+        if not plan_check:
+            raise HTTPException(status_code=403, detail="Unauthorized: Plan does not belong to user")
+            
         if payload.is_completed:
-            # Insert or update completion safely
             query = text("""
                 INSERT INTO plan_day_completions (plan_id, user_id, week_number, day_number, is_completed)
                 VALUES (:pid, :uid, :wn, :dn, true)
@@ -392,7 +425,6 @@ def toggle_plan_completion(plan_id: str, payload: DayCompletionToggle):
                 DO UPDATE SET is_completed = true, completed_at = now()
             """)
         else:
-            # Remove completion if unchecked
             query = text("""
                 DELETE FROM plan_day_completions 
                 WHERE plan_id = :pid AND week_number = :wn AND day_number = :dn
