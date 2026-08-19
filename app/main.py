@@ -14,7 +14,7 @@ from langchain_groq import ChatGroq
 
 load_dotenv()
 
-app = FastAPI(title="CoachSaab API", version="5.0")
+app = FastAPI(title="CoachSaab API", version="5.1")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 engine = create_engine(DATABASE_URL)
@@ -56,7 +56,7 @@ class AgentState(TypedDict):
     user_id: str
     user_profile: dict
     missing_fields: list
-    extracted_updates: Optional[dict]
+    extracted_updates: dict
     intent: str
 
 def load_state_node(state: AgentState):
@@ -72,6 +72,11 @@ def load_state_node(state: AgentState):
         return {"user_profile": {}, "missing_fields": ["Profile Error"]}
 
     profile = dict(user_row)
+    
+    # FIX: Convert Postgres Decimal to Python Float so json.dumps() doesn't crash!
+    if profile.get("weight_kg") is not None:
+        profile["weight_kg"] = float(profile["weight_kg"])
+
     missing = []
     if profile.get("age") is None: missing.append("Age")
     if profile.get("weight_kg") is None: missing.append("Weight (kg)")
@@ -82,13 +87,18 @@ def load_state_node(state: AgentState):
 
 def extract_profile_node(state: AgentState):
     """Passively extracts any profile data mentioned in the latest user message."""
-    latest_msg = state["messages"][-1].content
-    extractor = llm.with_structured_output(ProfileExtractionSchema)
-    extracted = extractor.invoke([
-        SystemMessage(content="Extract any age, weight, goals, or exercise preferences mentioned. Return null for fields not mentioned."),
-        HumanMessage(content=latest_msg)
-    ])
-    return {"extracted_updates": extracted.model_dump(exclude_none=True)}
+    try:
+        latest_msg = state["messages"][-1].content
+        extractor = llm.with_structured_output(ProfileExtractionSchema)
+        extracted = extractor.invoke([
+            SystemMessage(content="Extract any age, weight, goals, or exercise preferences mentioned. Return null for fields not mentioned."),
+            HumanMessage(content=latest_msg)
+        ])
+        updates = extracted.model_dump(exclude_none=True) if extracted else {}
+        return {"extracted_updates": updates}
+    except Exception as e:
+        print(f"Extraction Error: {str(e)}")
+        return {"extracted_updates": {}}
 
 def update_database_node(state: AgentState):
     """Merges new profile extractions into the database (arrays are appended)."""
@@ -113,46 +123,59 @@ def update_database_node(state: AgentState):
     if "goals" in updates:
         existing = profile.get("goals") or []
         merged = list(set(existing + updates["goals"]))
-        set_clauses.append("goals = :goals")
+        set_clauses.append("goals = CAST(:goals AS TEXT[])")
         params["goals"] = merged
         
     if "preferred_categories" in updates:
         existing = profile.get("preferred_categories") or []
         merged = list(set(existing + updates["preferred_categories"]))
-        set_clauses.append("preferred_categories = :prefs")
+        set_clauses.append("preferred_categories = CAST(:prefs AS TEXT[])")
         params["prefs"] = merged
 
     if set_clauses:
-        with engine.begin() as conn:
-            query = text(f"UPDATE users SET {', '.join(set_clauses)}, updated_at = now() WHERE user_id = :uid")
-            conn.execute(query, params)
-            
-    # Trigger a state reload for subsequent nodes
+        try:
+            with engine.begin() as conn:
+                query = text(f"UPDATE users SET {', '.join(set_clauses)}, updated_at = now() WHERE user_id = :uid")
+                conn.execute(query, params)
+        except Exception as e:
+            print(f"DB Update Error: {str(e)}")
+                
+    # Trigger a state reload for subsequent nodes so they have the fresh data
     return load_state_node(state)
 
 def determine_intent_node(state: AgentState):
     """Determines if the user wants a plan or is just chatting."""
-    latest_msg = state["messages"][-1].content
-    intent_analyzer = llm.with_structured_output(IntentSchema)
-    result = intent_analyzer.invoke([
-        SystemMessage(content="Determine if the user is asking to create, generate, or start a new workout plan/routine. If yes, intent is 'plan'. Otherwise, 'chat'."),
-        HumanMessage(content=latest_msg)
-    ])
-    return {"intent": result.intent}
+    try:
+        latest_msg = state["messages"][-1].content
+        intent_analyzer = llm.with_structured_output(IntentSchema)
+        result = intent_analyzer.invoke([
+            SystemMessage(content="Determine if the user is asking to create, generate, or start a new workout plan/routine. If yes, intent is 'plan'. Otherwise, 'chat'."),
+            HumanMessage(content=latest_msg)
+        ])
+        intent_val = result.intent if result else "chat"
+        return {"intent": intent_val}
+    except Exception as e:
+        print(f"Intent Error: {str(e)}")
+        return {"intent": "chat"}
 
-def route_intent(state: AgentState):
-    """Routes the graph based on intent and profile completeness."""
-    if state["intent"] == "plan":
-        if len(state["missing_fields"]) > 0:
+def route_intent(state: AgentState) -> str:
+    """Hard-routes the graph based on intent and missing fields."""
+    intent = state.get("intent", "chat")
+    missing = state.get("missing_fields", [])
+    
+    if intent == "plan":
+        if missing:
             return "ask_question"
         else:
             return "generate_plan"
     return "normal_chat"
 
 def ask_question_node(state: AgentState):
-    """Asks for exactly ONE missing profile field."""
-    missing = state["missing_fields"][0]
-    prompt = f"The user wants a plan, but we are missing: {missing}. Ask them for it politely and conversationally in 1 short sentence."
+    """Politely asks the user for ONE missing profile field."""
+    missing = state.get("missing_fields", [])
+    target_field = missing[0] if missing else "information"
+    
+    prompt = f"The user asked for a workout plan, but we are missing: {target_field}. Ask them for this specific field politely and conversationally in 1 short sentence."
     response = llm.invoke([SystemMessage(content=prompt)])
     return {"messages": [response]}
 
@@ -163,39 +186,45 @@ def normal_chat_node(state: AgentState):
     User Profile: {profile_str}
     Keep responses brief, actionable, and conversational (1-3 sentences max). Do not use markdown styling."""
     
-    # We only send the conversation history to the standard chat node
     response = llm.invoke([SystemMessage(content=sys_prompt)] + state["messages"])
     return {"messages": [response]}
 
 def generate_plan_node(state: AgentState):
     """Forces the LLM to output a strict JSON plan, saves to DB, and returns confirmation."""
-    profile_str = json.dumps(state["user_profile"])
-    plan_generator = llm.with_structured_output(WorkoutPlanSchema)
-    
-    # 1. Generate Structured Plan
-    plan_data = plan_generator.invoke([
-        SystemMessage(content=f"Create a highly effective custom workout plan for this user. User Profile: {profile_str}"),
-        HumanMessage(content="Generate my plan.")
-    ])
-    
-    # 2. Save to Database
-    user_id = state["user_id"]
-    db_json = plan_data.model_dump()
-    db_json["status"] = "active"
-    
-    plan_name = f"{state['user_profile'].get('name', 'My')} {plan_data.duration_weeks}-Week Plan"
-    
-    with engine.begin() as conn:
-        conn.execute(text("UPDATE workout_plans SET is_active = false WHERE user_id = :uid"), {"uid": user_id})
-        query = text("""
-            INSERT INTO workout_plans (user_id, plan_name, plan_json, is_active)
-            VALUES (:uid, :name, :data, true)
-        """)
-        conn.execute(query, {"uid": user_id, "name": plan_name, "data": json.dumps(db_json)})
+    try:
+        profile_str = json.dumps(state["user_profile"])
+        plan_generator = llm.with_structured_output(WorkoutPlanSchema)
         
-    # 3. Return conversational confirmation
-    msg = AIMessage(content=f"I've successfully generated your custom {plan_data.duration_weeks}-week '{plan_data.goal}' plan! Check your Home tab to see the breakdown.")
-    return {"messages": [msg]}
+        # 1. Generate Structured Plan
+        plan_data = plan_generator.invoke([
+            SystemMessage(content=f"Create a highly effective custom workout plan for this user. User Profile: {profile_str}"),
+            HumanMessage(content="Generate my plan.")
+        ])
+        
+        if not plan_data:
+            return {"messages": [AIMessage(content="I'm having a little trouble formulating the perfect routine right now. Let's try again!")]}
+        
+        # 2. Save to Database
+        user_id = state["user_id"]
+        db_json = plan_data.model_dump()
+        db_json["status"] = "active"
+        
+        plan_name = f"{state['user_profile'].get('name', 'My')} {plan_data.duration_weeks}-Week Plan"
+        
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE workout_plans SET is_active = false WHERE user_id = :uid"), {"uid": user_id})
+            query = text("""
+                INSERT INTO workout_plans (user_id, plan_name, plan_json, is_active)
+                VALUES (:uid, :name, :data, true)
+            """)
+            conn.execute(query, {"uid": user_id, "name": plan_name, "data": json.dumps(db_json)})
+            
+        # 3. Return conversational confirmation
+        msg = AIMessage(content=f"I've successfully generated your custom {plan_data.duration_weeks}-week '{plan_data.goal}' plan! Check your Home tab to see the breakdown.")
+        return {"messages": [msg]}
+    except Exception as e:
+        print(f"Plan Gen Error: {str(e)}")
+        return {"messages": [AIMessage(content=f"Uh oh! I ran into an error generating your plan: {str(e)}")]}
 
 # Compile the Graph
 graph_builder = StateGraph(AgentState)
@@ -352,19 +381,25 @@ def add_chat_message(conversation_id: str, message: ChatMessageCreate):
                 elif row['role'] == 'assistant':
                     lg_messages.append(AIMessage(content=row['content']))
 
-        # Invoke the Deterministic State Machine
+        # Initialize full explicit state to prevent LangGraph KeyErrors
         initial_state = {
             "messages": lg_messages,
-            "user_id": user_id
+            "user_id": user_id,
+            "user_profile": {},
+            "missing_fields": [],
+            "extracted_updates": {},
+            "intent": "chat"
         }
         
+        # Invoke the Deterministic State Machine
         result = agent_graph.invoke(initial_state)
         raw_reply = result["messages"][-1].content
         ai_reply = clean_ai_response(raw_reply)
         
     except Exception as e:
         print(f"Backend Server Error: {str(e)}")
-        ai_reply = f"I ran into a temporary issue processing that. Let's try again!"
+        # OUTPUT EXACT ERROR TO APP FOR DEBUGGING
+        ai_reply = f"SYSTEM ERROR: {str(e)}"
 
     with engine.begin() as conn:
         insert_ai_msg = text("""
