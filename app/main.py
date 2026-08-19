@@ -92,8 +92,13 @@ def extract_profile_node(state: AgentState):
     try:
         latest_msg = state["messages"][-1].content
         extractor = llm.with_structured_output(ProfileExtractionSchema)
+        
+        # FIX: Provide context on what is currently missing to help the LLM map numbers correctly.
+        missing_context = ", ".join(state.get("missing_fields", []))
+        sys_prompt = f"Extract age, weight, goals, or exercise preferences. The user is currently missing: {missing_context}. If they provide a lone number, map it logically to the missing fields."
+        
         extracted = extractor.invoke([
-            SystemMessage(content="Extract any age, weight, goals, or exercise preferences mentioned. Return null for fields not mentioned."),
+            SystemMessage(content=sys_prompt),
             HumanMessage(content=latest_msg)
         ])
         updates = extracted.model_dump(exclude_none=True) if extracted else {}
