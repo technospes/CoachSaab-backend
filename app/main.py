@@ -14,7 +14,7 @@ from langchain_groq import ChatGroq
 
 load_dotenv()
 
-app = FastAPI(title="CoachSaab API", version="5.1")
+app = FastAPI(title="CoachSaab API", version="5.2")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 engine = create_engine(DATABASE_URL)
@@ -30,11 +30,11 @@ llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.2)
 class DailyWorkout(BaseModel):
     day_number: int = Field(..., description="Day of the week (1 to 7)")
     focus: str = Field(..., description="Workout focus (e.g., 'UPPER BODY', 'LOWER BODY', 'ACTIVE RECOVERY', 'REST DAY')")
-    exercises: List[str] = Field(..., description="List of exercise names (e.g., ['Push Up', 'Plank']). Empty if rest day.")
+    exercises: List[str] = Field(..., description="List of exercises WITH sets, reps, or time included in the string. Example: ['Barbell Squat (3 sets x 10 reps)', 'Plank (60 seconds)']. Empty if rest day.")
     is_rest: bool = Field(..., description="True if this is a rest day")
 
 class WorkoutPlanSchema(BaseModel):
-    duration_weeks: int = Field(..., gt=0, le=12, description="Duration in weeks (max 12)")
+    duration_weeks: int = Field(..., gt=0, le=12, description="Duration in weeks. Keep it short (2 to 4 weeks max) for quick user milestones, unless the user explicitly requested a longer plan.")
     goal: str = Field(..., description="Main objective of the plan")
     notes: str = Field(..., description="Additional coaching advice and progression instructions")
     schedule: List[DailyWorkout] = Field(..., description="A 7-day schedule template (Days 1-7) that repeats each week")
@@ -75,7 +75,6 @@ def load_state_node(state: AgentState):
 
     profile = dict(user_row)
     
-    # FIX: Convert Postgres Decimal to Python Float so json.dumps() doesn't crash!
     if profile.get("weight_kg") is not None:
         profile["weight_kg"] = float(profile["weight_kg"])
 
@@ -93,9 +92,8 @@ def extract_profile_node(state: AgentState):
         latest_msg = state["messages"][-1].content
         extractor = llm.with_structured_output(ProfileExtractionSchema)
         
-        # FIX: Provide context on what is currently missing to help the LLM map numbers correctly.
         missing_context = ", ".join(state.get("missing_fields", []))
-        sys_prompt = f"Extract age, weight, goals, or exercise preferences. The user is currently missing: {missing_context}. If they provide a lone number, map it logically to the missing fields."
+        sys_prompt = f"Extract age, weight, goals, or exercise preferences. User is currently missing: {missing_context}. YOU MUST OUTPUT A VALID JSON TOOL CALL. DO NOT respond with conversational text."
         
         extracted = extractor.invoke([
             SystemMessage(content=sys_prompt),
@@ -111,7 +109,7 @@ def update_database_node(state: AgentState):
     """Merges new profile extractions into the database (arrays are appended)."""
     updates = state.get("extracted_updates", {})
     if not updates:
-        return {} # Nothing to update
+        return {} 
     
     user_id = state["user_id"]
     profile = state["user_profile"]
@@ -126,7 +124,6 @@ def update_database_node(state: AgentState):
         set_clauses.append("weight_kg = :weight")
         params["weight"] = updates["weight_kg"]
         
-    # MERGE ARRAYS INSTEAD OF OVERWRITING
     if "goals" in updates:
         existing = profile.get("goals") or []
         merged = list(set(existing + updates["goals"]))
@@ -147,24 +144,20 @@ def update_database_node(state: AgentState):
         except Exception as e:
             print(f"DB Update Error: {str(e)}")
                 
-    # Trigger a state reload for subsequent nodes so they have the fresh data
     return load_state_node(state)
 
 def determine_intent_node(state: AgentState):
     """Determines if the user wants a plan or is just chatting."""
     try:
-        # FIX: Look at the last 4 messages to maintain conversational context!
         recent_msgs = state["messages"][-4:]
         context_str = "\n".join([f"{'User' if m.type == 'human' else 'AI'}: {m.content}" for m in recent_msgs])
         
         intent_analyzer = llm.with_structured_output(IntentSchema)
         result = intent_analyzer.invoke([
             SystemMessage(content=(
-                "Analyze the recent conversation context. "
-                "Is the user's overarching goal right now to generate/create a workout plan? "
-                "If they previously asked for a plan and are now providing their age, weight, goals, or preferences to complete the profile for it, the intent is STILL 'plan'. "
-                "If they explicitly ask for a plan, the intent is 'plan'. "
-                "If they are just asking general fitness questions, intent is 'chat'."
+                "Analyze the recent conversation. Is the user's overarching goal right now to generate a workout plan? "
+                "If they previously asked for a plan and are now answering profile questions (age, weight, goals), intent is still 'plan'. "
+                "Otherwise, intent is 'chat'."
             )),
             HumanMessage(content=f"Recent Conversation:\n{context_str}")
         ])
@@ -175,7 +168,6 @@ def determine_intent_node(state: AgentState):
         return {"intent": "chat"}
 
 def route_intent(state: AgentState) -> str:
-    """Hard-routes the graph based on intent and missing fields."""
     intent = state.get("intent", "chat")
     missing = state.get("missing_fields", [])
     
@@ -187,21 +179,19 @@ def route_intent(state: AgentState) -> str:
     return "normal_chat"
 
 def ask_question_node(state: AgentState):
-    """Politely asks the user for ONE missing profile field."""
     missing = state.get("missing_fields", [])
     target_field = missing[0] if missing else "information"
     
-    prompt = f"The user asked for a workout plan, but we are missing: {target_field}. Ask them for this specific field politely and conversationally in 1 short sentence."
+    prompt = f"The user wants a workout plan, but we are missing: {target_field}. Ask them for this specific field politely in 1 short sentence."
     response = llm.invoke([SystemMessage(content=prompt)])
     return {"messages": [response]}
 
 def normal_chat_node(state: AgentState):
-    """Handles standard fitness conversation with full context."""
     profile_str = json.dumps(state["user_profile"])
     sys_prompt = f"""You are CoachSaab, a smart AI fitness coach. 
     User Profile: {profile_str}
     Keep responses brief, actionable, and conversational (1-3 sentences max). Do not use markdown styling.
-    CRITICAL RULE: NEVER generate a full day-by-day workout plan or routine in chat. If the user asks for a plan, tell them to say 'Generate my plan' so the system can build it officially."""
+    CRITICAL RULE: NEVER generate a full day-by-day workout plan or routine in chat. If they ask for one, just say 'Generate my plan' so the system can build it officially."""
     
     response = llm.invoke([SystemMessage(content=sys_prompt)] + state["messages"])
     return {"messages": [response]}
@@ -212,16 +202,25 @@ def generate_plan_node(state: AgentState):
         profile_str = json.dumps(state["user_profile"])
         plan_generator = llm.with_structured_output(WorkoutPlanSchema)
         
-        # 1. Generate Structured Plan
+        # STRICT SYSTEM PROMPT UPDATE for formatting
+        sys_prompt = f"""Create a highly effective custom workout plan for this user. 
+        User Profile: {profile_str}
+        CRITICAL RULES:
+        1. Limit the plan duration to 2, 3, or 4 weeks MAX (unless user specifically asked for longer). We want quick, achievable milestones.
+        2. In the `exercises` list, you MUST include the exact sets and reps OR time duration in the string itself. 
+           Example Good: "Barbell Back Squat (3 sets x 10 reps)"
+           Example Good: "Plank (60 seconds)"
+           Example Bad: "Barbell Back Squat"
+        """
+        
         plan_data = plan_generator.invoke([
-            SystemMessage(content=f"Create a highly effective custom workout plan for this user. User Profile: {profile_str}"),
-            HumanMessage(content="Generate my plan.")
+            SystemMessage(content=sys_prompt),
+            HumanMessage(content="Generate my plan based on my profile.")
         ])
         
         if not plan_data:
             return {"messages": [AIMessage(content="I'm having a little trouble formulating the perfect routine right now. Let's try again!")]}
         
-        # 2. Save to Database
         user_id = state["user_id"]
         db_json = plan_data.model_dump()
         db_json["status"] = "active"
@@ -236,7 +235,6 @@ def generate_plan_node(state: AgentState):
             """)
             conn.execute(query, {"uid": user_id, "name": plan_name, "data": json.dumps(db_json)})
             
-        # 3. Return conversational confirmation
         msg = AIMessage(content=f"I've successfully generated your custom {plan_data.duration_weeks}-week '{plan_data.goal}' plan! Check your Home tab to see the breakdown.")
         return {"messages": [msg]}
     except Exception as e:
@@ -288,6 +286,12 @@ class WorkoutSessionCreate(BaseModel):
     dominant_deviation: Optional[str] = None
     deviations_json: Optional[dict] = {}
 
+class DayCompletionToggle(BaseModel):
+    user_id: str
+    week_number: int
+    day_number: int
+    is_completed: bool
+
 class UserCreate(BaseModel):
     name: str
     gender: Optional[str] = None
@@ -320,7 +324,6 @@ def create_conversation(user_id: str):
 @app.get("/api/v1/chat/conversations/{conversation_id}/messages")
 def get_chat_history(conversation_id: str):
     with engine.connect() as conn:
-        # Check if conversation exists first to prevent silent failures and foreign key errors
         conv = conn.execute(text("SELECT 1 FROM chatbot_conversations WHERE conversation_id = :c"), {"c": conversation_id}).fetchone()
         if not conv:
             raise HTTPException(status_code=404, detail="Conversation not found")
@@ -355,19 +358,56 @@ def save_workout_session(session: WorkoutSessionCreate):
 def get_active_plan(user_id: str):
     with engine.connect() as conn:
         query = text("""
-            SELECT plan_name, plan_json, created_at 
+            SELECT plan_id, user_id, plan_name, plan_json, created_at 
             FROM workout_plans 
             WHERE user_id = :uid AND is_active = true 
             ORDER BY created_at DESC LIMIT 1
         """)
         row = conn.execute(query, {"uid": user_id}).mappings().fetchone()
         if row:
-            return dict(row)
+            # Convert UUIDs to strings for safe JSON serialization
+            result_dict = dict(row)
+            result_dict['plan_id'] = str(result_dict['plan_id'])
+            result_dict['user_id'] = str(result_dict['user_id'])
+            return result_dict
         return {"status": "no_active_plan"}
+
+@app.get("/api/v1/plans/{plan_id}/completions")
+def get_plan_completions(plan_id: str):
+    with engine.connect() as conn:
+        query = text("SELECT week_number, day_number FROM plan_day_completions WHERE plan_id = :pid AND is_completed = true")
+        rows = conn.execute(query, {"pid": plan_id}).mappings().fetchall()
+        # Return format exactly as expected by Flutter UI: ['w1_d1', 'w2_d3', ...]
+        return [f"w{r['week_number']}_d{r['day_number']}" for r in rows]
+
+@app.post("/api/v1/plans/{plan_id}/completions/toggle")
+def toggle_plan_completion(plan_id: str, payload: DayCompletionToggle):
+    with engine.begin() as conn:
+        if payload.is_completed:
+            # Insert or update completion safely
+            query = text("""
+                INSERT INTO plan_day_completions (plan_id, user_id, week_number, day_number, is_completed)
+                VALUES (:pid, :uid, :wn, :dn, true)
+                ON CONFLICT (plan_id, week_number, day_number) 
+                DO UPDATE SET is_completed = true, completed_at = now()
+            """)
+        else:
+            # Remove completion if unchecked
+            query = text("""
+                DELETE FROM plan_day_completions 
+                WHERE plan_id = :pid AND week_number = :wn AND day_number = :dn
+            """)
+        
+        conn.execute(query, {
+            "pid": plan_id, 
+            "uid": payload.user_id,
+            "wn": payload.week_number, 
+            "dn": payload.day_number
+        })
+    return {"status": "success"}
 
 @app.post("/api/v1/chat/conversations/{conversation_id}/messages")
 def add_chat_message(conversation_id: str, message: ChatMessageCreate):
-    # 1. Validate conversation OUTSIDE the try block so it properly returns a 404
     with engine.begin() as conn:
         conv_query = text("SELECT user_id FROM chatbot_conversations WHERE conversation_id = :conv_id")
         conv_row = conn.execute(conv_query, {"conv_id": conversation_id}).mappings().fetchone()
@@ -377,13 +417,11 @@ def add_chat_message(conversation_id: str, message: ChatMessageCreate):
 
     try:
         with engine.begin() as conn:
-            # Insert incoming user message first
             conn.execute(
                 text("INSERT INTO chatbot_messages (conversation_id, role, content) VALUES (:conv_id, 'user', :content)"),
                 {"conv_id": conversation_id, "content": message.content}
             )
 
-            # Fetch chronological message history
             history_query = text("""
                 SELECT role, content FROM chatbot_messages 
                 WHERE conversation_id = :conv_id 
@@ -398,7 +436,6 @@ def add_chat_message(conversation_id: str, message: ChatMessageCreate):
                 elif row['role'] == 'assistant':
                     lg_messages.append(AIMessage(content=row['content']))
 
-        # Initialize full explicit state to prevent LangGraph KeyErrors
         initial_state = {
             "messages": lg_messages,
             "user_id": user_id,
@@ -408,14 +445,12 @@ def add_chat_message(conversation_id: str, message: ChatMessageCreate):
             "intent": "chat"
         }
         
-        # Invoke the Deterministic State Machine
         result = agent_graph.invoke(initial_state)
         raw_reply = result["messages"][-1].content
         ai_reply = clean_ai_response(raw_reply)
         
     except Exception as e:
         print(f"Backend Server Error: {str(e)}")
-        # OUTPUT EXACT ERROR TO APP FOR DEBUGGING
         ai_reply = f"SYSTEM ERROR: {str(e)}"
 
     with engine.begin() as conn:
