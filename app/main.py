@@ -16,7 +16,7 @@ from langchain_groq import ChatGroq
 
 load_dotenv()
 
-app = FastAPI(title="CoachSaab API", version="6.1")
+app = FastAPI(title="CoachSaab API", version="6.0")
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 engine = create_engine(DATABASE_URL)
@@ -45,6 +45,11 @@ class WorkoutPlanSchema(BaseModel):
     notes: str = Field(..., description="Additional coaching advice and progression instructions")
     schedule: List[DailyWorkout] = Field(..., description="A 7-day schedule template (Days 1-7)")
 
+# ------------------------------------------
+# v6.1: Internal schema the LLM actually fills in for NEW plans.
+# The LLM still emits plain exercise name strings (no IDs) - the
+# backend is solely responsible for minting exercise_ids afterwards.
+# ------------------------------------------
 class DailyWorkoutDraft(BaseModel):
     day_number: int
     focus: str
@@ -58,16 +63,27 @@ class WorkoutPlanDraftSchema(BaseModel):
     schedule: List[DailyWorkoutDraft]
 
 # ==========================================
-# STABLE EXERCISE ID HELPERS
+# v6.1: STABLE EXERCISE ID HELPERS
 # ==========================================
 def generate_exercise_id() -> str:
+    """New exercises always get a fresh random ID. The LLM never sees/sets this."""
     return uuid.uuid4().hex[:12]
 
 def generate_legacy_exercise_id(plan_id: str, day_number: int, exercise_index: int) -> str:
+    """
+    Deterministic ID for legacy string-only exercises, derived from stable
+    plan/day/index info. Same inputs -> same ID every time, so legacy plans
+    don't get a new random ID minted on every load.
+    """
     raw = f"{plan_id}:{day_number}:{exercise_index}"
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:12]
 
 def assign_ids_to_draft_plan(draft: WorkoutPlanDraftSchema) -> dict:
+    """
+    Converts a freshly-LLM-generated draft plan (plain exercise name strings)
+    into the final stored object format, minting a new exercise_id for every
+    exercise. The backend does this - never the LLM.
+    """
     schedule = []
     for day in draft.schedule:
         exercises = [
@@ -88,6 +104,18 @@ def assign_ids_to_draft_plan(draft: WorkoutPlanDraftSchema) -> dict:
     }
 
 def normalize_plan_json(plan_json: dict, plan_id: str) -> tuple[dict, bool]:
+    """
+    Ensures every exercise in every day of plan_json is in the
+    {"exercise_id": ..., "name": ...} object format.
+
+    Legacy plans store exercises as plain strings - these get a
+    deterministic ID derived from (plan_id, day_number, exercise_index)
+    so the ID is stable across repeated loads.
+
+    Returns (normalized_plan_json, changed) where `changed` indicates
+    whether any legacy strings were converted (so callers can decide
+    whether to persist the normalized form back to the DB).
+    """
     if not plan_json or "schedule" not in plan_json:
         return plan_json, False
 
@@ -106,13 +134,15 @@ def normalize_plan_json(plan_json: dict, plan_id: str) -> tuple[dict, bool]:
             elif isinstance(ex, dict) and "exercise_id" in ex and "name" in ex:
                 normalized_exercises.append(ex)
             else:
+                # Unrecognized shape - skip rather than silently corrupt data.
                 continue
         day["exercises"] = normalized_exercises
 
     return plan_json, changed
 
+
 # ==========================================
-# PLAN MODIFICATION SCHEMAS
+# v6.1: PLAN MODIFICATION SCHEMAS
 # ==========================================
 class AddExerciseOp(BaseModel):
     type: Literal["add_exercise"]
@@ -131,7 +161,7 @@ class ReplaceExerciseOp(BaseModel):
 class ModifyExerciseOp(BaseModel):
     type: Literal["modify_exercise"]
     exercise_id: str
-    new_name: str
+    new_name: str  # full replacement string incl. updated sets/reps/time, same exercise_id preserved
 
 class ChangeDayFocusOp(BaseModel):
     type: Literal["change_day_focus"]
@@ -162,6 +192,10 @@ ModificationOperation = Union[
 ]
 
 class ModificationRequest(BaseModel):
+    """
+    LLM extraction output. Exactly one of `operations` / `clarification_question`
+    must be present - never both, never neither.
+    """
     operations: Optional[List[ModificationOperation]] = None
     clarification_question: Optional[str] = None
 
@@ -179,8 +213,11 @@ class ModificationRequest(BaseModel):
 # HELPER: ROBUST JSON PARSER
 # ==========================================
 def extract_json_from_text(text_content: str) -> dict:
+    """Strips <think> tags, markdown, and extracts the first valid JSON object."""
     try:
+        # Strip <think> tags
         cleaned = re.sub(r'<think>.*?</think>', '', text_content, flags=re.DOTALL | re.IGNORECASE)
+        # Find everything between first { and last }
         start_idx = cleaned.find('{')
         end_idx = cleaned.rfind('}')
         if start_idx != -1 and end_idx != -1:
@@ -210,12 +247,14 @@ class AgentState(TypedDict):
     user_profile: dict
     missing_fields: list
     extracted_updates: dict
-    intent: str
-    active_plan: Optional[dict]
-    modification_result: Optional[dict]
+    intent: str  # "chat" | "onboarding" | "modification"
+    # v6.1: plan-modification fields
+    active_plan: Optional[dict]          # {"plan_id": ..., "plan_json": {...}} or None
+    modification_result: Optional[dict]  # {"operations": [...]} | {"clarification_question": "..."}
     modification_error: Optional[str]
 
 def load_state_node(state: AgentState):
+    """Loads profile from DB and calculates missing fields deterministically."""
     user_id = state["user_id"]
     with engine.connect() as conn:
         user_row = conn.execute(
@@ -238,6 +277,10 @@ def load_state_node(state: AgentState):
 
     return {"user_profile": profile, "missing_fields": missing}
 
+# v6.1: Modification-intent keyword sets. These only decide ROUTING
+# (which node handles the message), never which exercise gets touched -
+# exercise-level decisions are always deterministic ID validation
+# downstream, resolved semantically by the LLM in extract_modification_node.
 MODIFICATION_VERBS = [
     "remove", "delete", "replace", "swap", "substitute",
     "add", "modify", "update", "change",
@@ -253,9 +296,15 @@ INJURY_TERMS = [
 ]
 
 def _mentions_day_or_week_reference(text_lower: str) -> bool:
+    """Matches things like 'day 1', 'day2', 'week 3' etc."""
     return bool(re.search(r"\b(day|week)\s*\d+\b", text_lower))
 
 def load_active_plan_node(state: AgentState):
+    """
+    Loads the user's currently active plan (if any) and normalizes legacy
+    string-exercise entries into stable-ID object form. Runs before intent
+    routing so modification-intent can be gated on "does an active plan exist".
+    """
     user_id = state["user_id"]
     with engine.connect() as conn:
         row = conn.execute(
@@ -279,6 +328,9 @@ def load_active_plan_node(state: AgentState):
     normalized_json, changed = normalize_plan_json(plan_json, plan_id)
 
     if changed:
+        # Persist the normalized (now-object-format) legacy plan back once,
+        # so future loads read the object format directly. Safe: we only
+        # rewrite the exercises field shape, nothing else in plan_json.
         try:
             with engine.begin() as conn:
                 conn.execute(
@@ -287,22 +339,28 @@ def load_active_plan_node(state: AgentState):
                 )
         except Exception as e:
             print(f"Legacy plan normalization persist error: {str(e)}")
+            # Non-fatal: normalized_json is still used in-memory for this request.
 
     return {"active_plan": {"plan_id": plan_id, "plan_json": normalized_json}}
 
 def determine_intent_node(state: AgentState):
+    """DETERMINISTIC ROUTER: No LLM used here. Checks chat history/message for intent."""
     latest_user_msg = state["messages"][-1].content.lower()
     has_active_plan = bool(state.get("active_plan"))
 
+    # 1. Did the AI just ask an onboarding question?
     ai_asked_question = False
     if len(state["messages"]) >= 2:
         last_ai_msg = state["messages"][-2].content
         if any(q in last_ai_msg for q in QUESTIONS.values()):
             ai_asked_question = True
 
+    # 2. Did the user explicitly trigger a plan request?
     plan_triggers = ["plan", "routine", "program", "schedule", "workout"]
     user_wants_plan = any(t in latest_user_msg for t in plan_triggers)
 
+    # 3. v6.1 Modification intent (conservative, deterministic):
+    #    Only selectable when an active plan actually exists.
     if has_active_plan:
         has_mod_verb = any(v in latest_user_msg for v in MODIFICATION_VERBS)
         has_plan_ref = (
@@ -311,15 +369,20 @@ def determine_intent_node(state: AgentState):
         )
         has_injury_language = any(t in latest_user_msg for t in INJURY_TERMS)
 
+        # verb + plan-reference (e.g. "remove squats from my plan") -> modification
+        # bare injury statement (e.g. "my knee hurts") -> modification, so the
+        #   extraction node can ask what they'd like changed
         if (has_mod_verb and has_plan_ref) or has_injury_language:
             return {"intent": "modification"}
 
+    # If the user wants a plan, or is currently answering an onboarding question, route to extraction
     if ai_asked_question or user_wants_plan:
         return {"intent": "onboarding"}
     
     return {"intent": "chat"}
 
 def extract_profile_node(state: AgentState):
+    """Uses LLM only for semantic extraction (and inferring numbers)."""
     try:
         latest_msg = state["messages"][-1].content
         missing_context = ", ".join(state.get("missing_fields", []))
@@ -346,9 +409,10 @@ def extract_profile_node(state: AgentState):
         return {"extracted_updates": {}}
 
 def update_database_node(state: AgentState):
+    """Merges new extractions into DB. If no updates, state remains unchanged."""
     updates = state.get("extracted_updates", {})
     if not updates:
-        return load_state_node(state)
+        return load_state_node(state) # Reload state to check if we should ask the next question
     
     user_id = state["user_id"]
     profile = state["user_profile"]
@@ -386,6 +450,7 @@ def update_database_node(state: AgentState):
     return load_state_node(state)
 
 def ask_question_node(state: AgentState):
+    """DETERMINISTIC: Outputs a hardcoded question. No LLM used."""
     missing = state.get("missing_fields", [])
     target_field = missing[0] if missing else "Age"
     return {"messages": [AIMessage(content=QUESTIONS[target_field])]}
@@ -401,6 +466,12 @@ def normal_chat_node(state: AgentState):
     return {"messages": [response]}
 
 def generate_plan_node(state: AgentState):
+    """Generates the plan and uses robust JSON parsing to bypass <think> tags.
+
+    v6.1: The LLM still emits plain exercise name strings (WorkoutPlanDraftSchema).
+    The backend - not the LLM - assigns a stable exercise_id to every exercise
+    before the plan is validated/persisted in the new object format.
+    """
     try:
         profile_str = json.dumps(state["user_profile"])
         schema_json = WorkoutPlanDraftSchema.model_json_schema()
@@ -426,6 +497,7 @@ def generate_plan_node(state: AgentState):
              
         draft_plan = WorkoutPlanDraftSchema.model_validate(extracted_json)
 
+        # Backend assigns exercise_ids and produces the final object-format plan.
         db_json = assign_ids_to_draft_plan(draft_plan)
         db_json["status"] = "active"
         
@@ -446,7 +518,12 @@ def generate_plan_node(state: AgentState):
         print(f"Plan Gen Error: {str(e)}")
         return {"messages": [AIMessage(content=f"SYSTEM ERROR: {str(e)}")]}
 
+# ==========================================
+# v6.1: PLAN MODIFICATION NODES
+# ==========================================
 def _render_plan_for_llm(plan_json: dict) -> str:
+    """Compact human-readable representation of the active plan, WITH exercise_ids,
+    so the LLM can resolve natural-language requests to real IDs."""
     lines = []
     for day in plan_json.get("schedule", []):
         lines.append(f"Day {day.get('day_number')} ({day.get('focus')}):")
@@ -457,9 +534,18 @@ def _render_plan_for_llm(plan_json: dict) -> str:
     return "\n".join(lines)
 
 def extract_modification_node(state: AgentState):
+    """
+    LLM = semantic extraction ONLY. It sees the active plan (with real
+    exercise_ids) and the user's natural-language request, and must return
+    either a list of operations referencing ONLY IDs shown in the plan, or
+    a clarification question if the request is ambiguous. It never invents
+    IDs and never decides medical/safety questions.
+    """
     try:
         active_plan = state.get("active_plan")
         if not active_plan:
+            # Should not normally happen (router gates on active_plan existing),
+            # but guard defensively.
             return {"modification_error": "no_active_plan"}
 
         plan_repr = _render_plan_for_llm(active_plan["plan_json"])
@@ -479,8 +565,8 @@ RULES:
 2. You MUST use `operations` OR `clarification_question`, never both.
 3. NEVER invent an exercise_id. Only use IDs shown above, exactly as written.
 4. For remove/replace/modify operations, reference the exercise by its exercise_id, not by name.
-5. If the request is ambiguous, return a `clarification_question` instead of guessing.
-6. Do NOT diagnose any injury. Only extract what the user explicitly asked to change.
+5. If the request is ambiguous (e.g. could match more than one exercise, or you cannot tell which day/exercise is meant), you MUST return a `clarification_question` instead of guessing.
+6. Do NOT diagnose any injury or decide if an exercise is medically safe. Only extract what the user explicitly asked to change and why (if they gave a reason).
 7. For add_exercise, you do not need to invent an exercise_id - the backend assigns it.
 8. Do not include <think> tags in the final JSON.
 """
@@ -501,6 +587,11 @@ RULES:
         return {"modification_error": "extraction_failed"}
 
 def _validate_operations(operations: list, plan_json: dict) -> Optional[str]:
+    """
+    Deterministic validation. Returns an error string if ANY operation is
+    invalid (bad exercise_id, bad day_number, bad duration), else None.
+    ALL-valid -> apply ALL. ANY-invalid -> apply NONE.
+    """
     valid_ids = {
         ex["exercise_id"]
         for day in plan_json.get("schedule", [])
@@ -552,6 +643,13 @@ def _validate_operations(operations: list, plan_json: dict) -> Optional[str]:
     return None
 
 def _apply_operations(operations: list, plan_json: dict) -> tuple[dict, set]:
+    """
+    Deterministically applies already-validated operations to plan_json.
+    Returns (new_plan_json, affected_day_numbers) where affected_day_numbers
+    is the set of day_numbers whose exercise LIST changed (and therefore
+    need their checklist completion reset). change_day_focus and
+    change_duration do NOT add to affected_day_numbers.
+    """
     days_by_number = {day["day_number"]: day for day in plan_json.get("schedule", [])}
     affected_days = set()
 
@@ -588,7 +686,7 @@ def _apply_operations(operations: list, plan_json: dict) -> tuple[dict, set]:
             for day in plan_json.get("schedule", []):
                 for ex in day.get("exercises", []):
                     if ex["exercise_id"] == target_id:
-                        ex["name"] = op["new_name"]
+                        ex["name"] = op["new_name"]  # exercise_id preserved
                         affected_days.add(day["day_number"])
 
         elif op_type == "modify_exercise":
@@ -596,7 +694,7 @@ def _apply_operations(operations: list, plan_json: dict) -> tuple[dict, set]:
             for day in plan_json.get("schedule", []):
                 for ex in day.get("exercises", []):
                     if ex["exercise_id"] == target_id:
-                        ex["name"] = op["new_name"]
+                        ex["name"] = op["new_name"]  # exercise_id preserved
                         affected_days.add(day["day_number"])
 
         elif op_type == "rest_day":
@@ -609,13 +707,22 @@ def _apply_operations(operations: list, plan_json: dict) -> tuple[dict, set]:
         elif op_type == "change_day_focus":
             day = days_by_number[op["day_number"]]
             day["focus"] = op["new_focus"]
+            # focus-only change does NOT reset completion
 
         elif op_type == "change_duration":
             plan_json["duration_weeks"] = op["new_duration_weeks"]
+            # duration-only change does NOT reset completion
 
     return plan_json, affected_days
 
 def apply_modification_node(state: AgentState):
+    """
+    Deterministically validates then applies the extracted operations.
+    ALL-or-nothing: if any operation is invalid, NOTHING is modified.
+    Plan update + affected-day completion cleanup happen in ONE atomic
+    DB transaction (engine.begin()) using the SAME plan_id (no new plan
+    row is ever created for a modification).
+    """
     try:
         active_plan = state.get("active_plan")
         mod_result = state.get("modification_result") or {}
@@ -627,6 +734,8 @@ def apply_modification_node(state: AgentState):
         plan_id = active_plan["plan_id"]
         user_id = state["user_id"]
 
+        # SECURITY: re-verify ownership of this exact plan_id right before writing,
+        # never trust an ID that wasn't loaded for this authenticated user.
         with engine.connect() as conn:
             owner_check = conn.execute(
                 text("SELECT 1 FROM workout_plans WHERE plan_id = :pid AND user_id = :uid AND is_active = true"),
@@ -635,15 +744,18 @@ def apply_modification_node(state: AgentState):
         if not owner_check:
             return {"messages": [AIMessage(content="I couldn't verify that plan belongs to you, so no changes were made.")]}
 
-        plan_json = json.loads(json.dumps(active_plan["plan_json"]))
+        plan_json = json.loads(json.dumps(active_plan["plan_json"]))  # deep copy, don't mutate state in place
 
         validation_error = _validate_operations(operations, plan_json)
         if validation_error:
             print(f"Modification validation failed, applying NONE: {validation_error}")
-            return {"messages": [AIMessage(content="I couldn't safely apply that change, so nothing was modified. Could you clarify what you'd like changed?")]}
+            return {"messages": [AIMessage(content="I couldn't safely apply that change (it referenced something that doesn't match your current plan), so nothing was modified. Could you clarify what you'd like changed?")]}
 
         new_plan_json, affected_days = _apply_operations(operations, plan_json)
 
+        # Single atomic transaction: plan update + affected-day completion cleanup.
+        # Either both succeed or neither does - the plan is never left partially
+        # modified and checklist records are never reset without a matching plan write.
         try:
             with engine.begin() as conn:
                 conn.execute(
@@ -656,27 +768,36 @@ def apply_modification_node(state: AgentState):
                         {"pid": plan_id, "dn": day_number}
                     )
         except Exception as e:
-            print(f"Modification transaction failed: {str(e)}")
-            return {"messages": [AIMessage(content="Something went wrong while saving your changes. Please try again.")]}
+            print(f"Modification transaction failed, plan left unchanged: {str(e)}")
+            return {"messages": [AIMessage(content="Something went wrong while saving your changes, so your plan was left unchanged. Please try again.")]}
 
         reply = "Done! I've updated your workout plan."
         if affected_days:
             reply += f" Progress for day(s) {', '.join(str(d) for d in sorted(affected_days))} was reset since those exercises changed."
 
+        # Deterministic injury disclaimer - never LLM-generated, never a diagnosis.
         latest_user_msg = state["messages"][-1].content.lower()
         if any(t in latest_user_msg for t in INJURY_TERMS):
-            reply += " I can adjust your workout to avoid uncomfortable movements. If pain is significant, please consult a professional."
+            reply += (
+                " I can adjust your workout to avoid movements you've identified as uncomfortable. "
+                "If the pain is significant or persistent, please consider getting advice from a "
+                "qualified healthcare professional."
+            )
 
         return {"messages": [AIMessage(content=reply)]}
     except Exception as e:
         print(f"Apply Modification Error: {str(e)}")
-        return {"messages": [AIMessage(content="Something went wrong while modifying your plan. Please try again.")]}
+        return {"messages": [AIMessage(content="Something went wrong while modifying your plan, so it was left unchanged. Please try again.")]}
 
 def clarify_modification_node(state: AgentState):
+    """Returns the clarification question directly. Does NOT touch the database."""
     mod_result = state.get("modification_result") or {}
     question = mod_result.get("clarification_question")
+
     if not question:
-        question = "I wasn't able to understand exactly what you'd like changed. Could you rephrase that?"
+        # extraction_failed or no_active_plan fallback
+        question = "I wasn't able to understand exactly what you'd like changed in your plan. Could you rephrase that?"
+
     return {"messages": [AIMessage(content=question)]}
 
 # ==========================================
@@ -696,6 +817,10 @@ def route_after_update(state: AgentState) -> str:
     return "generate_plan"
 
 def route_after_modification_extraction(state: AgentState) -> str:
+    """
+    extract_modification -> clarification needed? -> clarify : validate/apply
+    Both branches are real, existing nodes and both reach END.
+    """
     mod_result = state.get("modification_result") or {}
     if mod_result.get("clarification_question") or state.get("modification_error"):
         return "clarify_modification"
@@ -849,6 +974,7 @@ def get_plan_completions(plan_id: str):
 @app.post("/api/v1/plans/{plan_id}/completions/toggle")
 def toggle_plan_completion(plan_id: str, payload: DayCompletionToggle):
     with engine.begin() as conn:
+        # SECURITY PATCH: Verify the user actually owns this plan!
         plan_check = conn.execute(
             text("SELECT 1 FROM workout_plans WHERE plan_id = :pid AND user_id = :uid"),
             {"pid": plan_id, "uid": payload.user_id}
