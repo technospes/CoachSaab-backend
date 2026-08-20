@@ -762,6 +762,31 @@ def get_active_plan(user_id: str, auth_user_id: str = Depends(get_current_user_i
     if not res.get("success"): return {"status": "no_active_plan"}
     return {"plan_id": res["plan_id"], "plan_name": res["plan_name"], "plan_json": res["plan_json"], "user_id": auth_user_id}
 
+# NEW: Endpoint to fetch the single most recent workout session for the Home Screen
+@app.get("/api/v1/users/{user_id}/sessions/recent")
+def get_recent_session(user_id: str, auth_user_id: str = Depends(get_current_user_id)):
+    """Fetches the single most recent workout session for the Home Screen"""
+    if user_id != auth_user_id: raise HTTPException(403, "Forbidden")
+    try:
+        with engine.connect() as conn:
+            row = conn.execute(
+                text("""
+                    SELECT activity_key, reps, duration_seconds, form_score, dominant_deviation, created_at 
+                    FROM workout_sessions 
+                    WHERE user_id = :uid 
+                    ORDER BY created_at DESC LIMIT 1
+                """),
+                {"uid": auth_user_id}
+            ).mappings().fetchone()
+        
+        if not row: return {"status": "no_sessions"}
+        
+        session_data = dict(row)
+        session_data["created_at"] = str(session_data["created_at"])
+        return {"status": "success", "session": session_data}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 @app.get("/api/v1/plans/{plan_id}/completions")
 def get_plan_completions(plan_id: str, auth_user_id: str = Depends(get_current_user_id)):
     with engine.connect() as conn:
