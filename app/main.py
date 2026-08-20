@@ -258,7 +258,8 @@ def load_state_node(state: AgentState):
     user_id = state["user_id"]
     with engine.connect() as conn:
         user_row = conn.execute(
-            text("SELECT name, age, weight_kg, goals, preferred_categories, about_me FROM users WHERE user_id = :uid"), 
+            # NEW: We now select height_cm and about_me directly into the AI's context!
+            text("SELECT name, age, weight_kg, height_cm, goals, preferred_categories, about_me FROM users WHERE user_id = :uid"), 
             {"uid": user_id}
         ).mappings().fetchone()
     
@@ -268,6 +269,8 @@ def load_state_node(state: AgentState):
     profile = dict(user_row)
     if profile.get("weight_kg") is not None:
         profile["weight_kg"] = float(profile["weight_kg"])
+    if profile.get("height_cm") is not None:
+        profile["height_cm"] = float(profile["height_cm"])
 
     missing = []
     if profile.get("age") is None: missing.append("Age")
@@ -890,6 +893,16 @@ class UserCreate(BaseModel):
     gender: Optional[str] = None
     goals: Optional[List[str]] = []
 
+# NEW: Model for handling the PUT request from the Profile Screen
+class UserUpdate(BaseModel):
+    name: Optional[str] = None
+    age: Optional[int] = None
+    weight_kg: Optional[float] = None
+    height_cm: Optional[float] = None
+    goals: Optional[List[str]] = None
+    preferred_categories: Optional[List[str]] = None
+    about_me: Optional[str] = None
+
 @app.get("/")
 def read_root():
     return {"message": "CoachSaab API Active 🚀"}
@@ -906,6 +919,44 @@ def create_user(user: UserCreate):
             "name": user.name, "gender": user.gender, "goals": user.goals
         }).mappings().fetchone()
         return dict(result)
+
+# NEW: Endpoint to fetch user data for the Profile Screen
+@app.get("/api/v1/users/{user_id}")
+def get_user_profile(user_id: str):
+    with engine.connect() as conn:
+        query = text("SELECT * FROM users WHERE user_id = :uid")
+        row = conn.execute(query, {"uid": user_id}).mappings().fetchone()
+        if not row:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        result_dict = dict(row)
+        result_dict['user_id'] = str(result_dict['user_id'])
+        return result_dict
+
+# NEW: Endpoint to save changes from the Profile Screen's edit form
+@app.put("/api/v1/users/{user_id}")
+def update_user_profile(user_id: str, profile: UserUpdate):
+    set_clauses = []
+    params = {"uid": user_id}
+    
+    update_data = profile.model_dump(exclude_unset=True) 
+    
+    if not update_data:
+        return {"status": "success", "message": "No fields to update"}
+        
+    for key, value in update_data.items():
+        if key in ["goals", "preferred_categories"]:
+            set_clauses.append(f"{key} = CAST(:{key} AS TEXT[])")
+            params[key] = value
+        else:
+            set_clauses.append(f"{key} = :{key}")
+            params[key] = value
+            
+    with engine.begin() as conn:
+        query = text(f"UPDATE users SET {', '.join(set_clauses)}, updated_at = now() WHERE user_id = :uid")
+        conn.execute(query, params)
+        
+    return {"status": "success"}
 
 @app.post("/api/v1/chat/conversations")
 def create_conversation(user_id: str):
