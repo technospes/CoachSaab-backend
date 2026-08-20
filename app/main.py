@@ -53,17 +53,9 @@ def startup_event():
 # 1. TRUE JWT AUTHENTICATION
 # ==========================================
 def get_current_user_id(request: Request) -> str:
-    """
-    PRODUCTION SECURITY: 
-    Extracts the JWT from the Authorization header, verifies the cryptographic signature,
-    and returns the 'sub' (subject) claim as the authenticated user_id.
-    """
     auth_header = request.headers.get("Authorization")
     
-    # 1. Reject if no token
     if not auth_header or not auth_header.startswith("Bearer "):
-        # MVP FALLBACK: For development, we allow passing ?user_id= in the URL.
-        # IN PRODUCTION: Remove this fallback entirely.
         fallback_id = request.query_params.get("user_id")
         if fallback_id: return fallback_id
         raise HTTPException(status_code=401, detail="Unauthorized: Missing token")
@@ -71,8 +63,6 @@ def get_current_user_id(request: Request) -> str:
     token = auth_header.split(" ")[1]
     
     try:
-        # 2. Cryptographic Verification
-        # In a real setup (Auth0/Firebase), you would fetch the JWKS to verify.
         payload = jwt.decode(token, JWT_SECRET_KEY, algorithms=[JWT_ALGORITHM])
         user_id = payload.get("sub")
         if not user_id:
@@ -82,9 +72,6 @@ def get_current_user_id(request: Request) -> str:
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Unauthorized: Token expired")
     except jwt.PyJWTError:
-        # MVP FALLBACK: If token fails decoding (because Flutter is sending a raw user_id instead of a JWT)
-        # we accept it for local testing. 
-        # IN PRODUCTION: Delete this exception catch fallback.
         if len(token) > 10: return token
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid token signature")
 
@@ -411,14 +398,11 @@ def execute_get_recent_sessions(user_id: str, args: ToolGetRecentWorkoutSessions
     except Exception as e: return _safe_db_error(e, "get_recent_sessions")
 
 def execute_analyze_exercise_trend(user_id: str, args: ToolGetExerciseTrend) -> dict:
-    """Calculates REAL rolling averages and trend direction based on historical sessions."""
     try:
         with engine.connect() as conn:
-            # Get up to limit rows, order ASC so newest are at the end
             rows = conn.execute(text("SELECT form_score, dominant_deviation, created_at FROM workout_sessions WHERE user_id = :uid AND activity_key = :key ORDER BY created_at ASC LIMIT :limit"), {"uid": user_id, "key": args.activity_key, "limit": args.limit}).mappings().fetchall()
         if not rows: return {"success": True, "message": "No empirical data found"}
         
-        # Isolate recent 3 vs previous 3
         recent_3 = rows[-3:]
         prev_3 = rows[-6:-3] if len(rows) >= 6 else rows[:-3]
         
@@ -439,7 +423,6 @@ def execute_analyze_exercise_trend(user_id: str, args: ToolGetExerciseTrend) -> 
     except Exception as e: return _safe_db_error(e, "analyze_trend")
 
 def execute_get_consistency(user_id: str) -> dict:
-    """Calculates TRUE elapsed expected completions vs actual completions."""
     active = execute_get_active_plan(user_id)
     if not active.get("success"): return active
     
@@ -450,19 +433,19 @@ def execute_get_consistency(user_id: str) -> dict:
     if total_expected == 0: return {"success": True, "overall_completion_rate": "0%"}
     
     try:
-        plan_created_at = datetime.fromisoprint(active["created_at"]) if isinstance(active["created_at"], str) else active["created_at"]
+        plan_created_at = datetime.fromisoformat(active["created_at"]) if isinstance(active["created_at"], str) else active["created_at"]
         days_since_start = (datetime.now(timezone.utc) - plan_created_at).days
         elapsed_weeks = days_since_start / 7.0
         
         if elapsed_weeks > total_weeks: elapsed_weeks = total_weeks
         total_expected_elapsed = int(elapsed_weeks * training_days_per_week)
-        if total_expected_elapsed <= 0: total_expected_elapsed = 1 # Avoid div zero on day 1
+        if total_expected_elapsed <= 0: total_expected_elapsed = 1
         
         with engine.connect() as conn:
             completions = conn.execute(text("SELECT completed_at FROM plan_day_completions WHERE plan_id = :pid"), {"pid": active["plan_id"]}).fetchall()
         
         rate = round((len(completions) / total_expected_elapsed) * 100, 1)
-        if rate > 100: rate = 100.0 # Cap at 100%
+        if rate > 100: rate = 100.0
         
         return {
             "success": True, 
@@ -627,22 +610,11 @@ def clean_ai_response(text_content: str) -> str:
     cleaned = cleaned.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
     return cleaned.strip()
 
-# Muscle mapping for real Analytics derivation
-EXERCISE_MUSCLE_MAP = {
-    "squat": "Legs", "lunge": "Legs", "deadlift": "Legs", "leg press": "Legs", "calf": "Legs",
-    "bench press": "Chest", "push-up": "Chest", "fly": "Chest", "push up": "Chest",
-    "pull-up": "Back", "pull up": "Back", "row": "Back", "lat pulldown": "Back",
-    "shoulder press": "Shoulders", "lateral raise": "Shoulders", "overhead": "Shoulders",
-    "bicep": "Arms", "tricep": "Arms", "curl": "Arms", "extension": "Arms",
-    "plank": "Core", "crunch": "Core", "sit-up": "Core", "leg raise": "Core"
-}
-
 @app.get("/api/v1/users/{user_id}/dashboard")
 def get_dashboard_data(user_id: str, timeframe: str = "This Week", auth_user_id: str = Depends(get_current_user_id)):
     """Generates empirically grounded analytical data for the Flutter Reports tab based on explicit timeframes."""
     if user_id != auth_user_id: raise HTTPException(403, "Forbidden")
     
-    # Timeframe SQL Interval Parsing
     interval_str = '7 days'
     if timeframe == "This Month": interval_str = '30 days'
     elif timeframe == "Last 4 Weeks": interval_str = '28 days'
@@ -654,7 +626,7 @@ def get_dashboard_data(user_id: str, timeframe: str = "This Week", auth_user_id:
     try:
         with engine.connect() as conn:
             rows = conn.execute(
-                text(f"SELECT activity_key, reps, form_score, created_at FROM workout_sessions WHERE user_id = :uid AND created_at >= NOW() - INTERVAL '{interval_str}' ORDER BY created_at ASC"),
+                text(f"SELECT activity_key, reps, form_score, dominant_deviation, created_at FROM workout_sessions WHERE user_id = :uid AND created_at >= NOW() - INTERVAL '{interval_str}' ORDER BY created_at ASC"),
                 {"uid": user_id}
             ).mappings().fetchall()
             
@@ -662,32 +634,33 @@ def get_dashboard_data(user_id: str, timeframe: str = "This Week", auth_user_id:
         total_reps = sum(r["reps"] for r in rows)
         avg_form = sum(r["form_score"] for r in rows) / total_workouts if total_workouts > 0 else 0
         
-        # Calculate Muscle Focus based on actual telemetry
-        focus = {"Chest": 0, "Back": 0, "Legs": 0, "Shoulders": 0, "Arms": 0, "Core": 0}
-        total_muscle_hits = 0
+        # Calculate Top Issues
+        deviations = [r["dominant_deviation"] for r in rows if r["dominant_deviation"]]
+        issue_counts = {}
+        for d in deviations:
+            clean_name = d.replace("_", " ").title()
+            issue_counts[clean_name] = issue_counts.get(clean_name, 0) + 1
+        top_issues = [{"issue": k, "count": v} for k, v in sorted(issue_counts.items(), key=lambda item: item[1], reverse=True)[:3]]
+        
+        # Calculate Exercise Performance
+        ex_data = {}
         for r in rows:
-            activity = r['activity_key'].lower()
-            matched = False
-            for key, muscle in EXERCISE_MUSCLE_MAP.items():
-                if key in activity:
-                    focus[muscle] += 1
-                    total_muscle_hits += 1
-                    matched = True
-                    break
-            if not matched:
-                focus["Core"] += 1 
-                total_muscle_hits += 1
-                
-        if total_muscle_hits == 0:
-            muscle_distribution = {"Chest": 30, "Back": 25, "Legs": 20, "Shoulders": 15, "Arms": 10} # Fallback UI mock
-        else:
-            muscle_distribution = {k: round((v/total_muscle_hits)*100) for k, v in focus.items() if v > 0}
+            key = r['activity_key'].title()
+            if key not in ex_data: ex_data[key] = []
+            ex_data[key].append(r["form_score"])
             
-        # Form Score Trend
+        ex_perf = []
+        for k, scores in ex_data.items():
+            prev = scores[0] if len(scores) > 0 else 0
+            curr = scores[-1] if len(scores) > 0 else 0
+            if len(scores) >= 3:
+                mid = len(scores) // 2
+                prev = sum(scores[:mid]) / len(scores[:mid])
+                curr = sum(scores[mid:]) / len(scores[mid:])
+            ex_perf.append({"name": k, "previous": round(prev), "current": round(curr)})
+            
         trend_data = [r["form_score"] for r in rows[-7:]]
         if len(trend_data) < 7: trend_data = [0] * (7 - len(trend_data)) + trend_data
-
-        recent = execute_get_recent_sessions(user_id, ToolGetRecentWorkoutSessions(limit=3)).get("recent_sessions", [])
 
         return {
             "total_workouts": total_workouts,
@@ -695,8 +668,8 @@ def get_dashboard_data(user_id: str, timeframe: str = "This Week", auth_user_id:
             "total_reps": total_reps,
             "avg_form_score": round(avg_form),
             "trend_data": trend_data,
-            "muscle_focus": muscle_distribution, 
-            "recent_sessions": recent
+            "common_issues": top_issues,
+            "exercise_performance": ex_perf
         }
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
