@@ -258,7 +258,7 @@ def load_state_node(state: AgentState):
     user_id = state["user_id"]
     with engine.connect() as conn:
         user_row = conn.execute(
-            text("SELECT name, age, weight_kg, goals, preferred_categories FROM users WHERE user_id = :uid"), 
+            text("SELECT name, age, weight_kg, goals, preferred_categories, about_me FROM users WHERE user_id = :uid"), 
             {"uid": user_id}
         ).mappings().fetchone()
     
