@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends, Header
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import create_engine, text
 from typing import Optional, List, Annotated, Literal, Union, Any
@@ -12,7 +12,6 @@ from datetime import datetime, timezone
 from dotenv import load_dotenv
 from typing_extensions import TypedDict
 import jwt  # PyJWT library for true authentication
-
 from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
@@ -52,14 +51,16 @@ def startup_event():
 # ==========================================
 # 1. TRUE JWT AUTHENTICATION
 # ==========================================
-def get_current_user_id(request: Request) -> str:
-    auth_header = request.headers.get("Authorization")
+def get_current_user_id(request: Request, authorization: Optional[str] = Header(None)) -> str:
+    """
+    Production-grade JWT authentication pipeline.
+    Verifies cryptographic signature and extracts subject (user_id).
+    """
+    auth_header = authorization or request.headers.get("Authorization")
     
     if not auth_header or not auth_header.startswith("Bearer "):
-        fallback_id = request.query_params.get("user_id")
-        if fallback_id: return fallback_id
-        raise HTTPException(status_code=401, detail="Unauthorized: Missing token")
-
+        raise HTTPException(status_code=401, detail="Unauthorized: Missing authentication token")
+    
     token = auth_header.split(" ")[1]
     
     try:
@@ -68,12 +69,17 @@ def get_current_user_id(request: Request) -> str:
         if not user_id:
             raise HTTPException(status_code=401, detail="Unauthorized: Invalid token payload")
         return str(user_id)
-        
     except jwt.ExpiredSignatureError:
         raise HTTPException(status_code=401, detail="Unauthorized: Token expired")
     except jwt.PyJWTError:
-        if len(token) > 10: return token
         raise HTTPException(status_code=401, detail="Unauthorized: Invalid token signature")
+    
+    # # Fallback to query param for explicit testing if needed
+    # fallback_id = request.query_params.get("user_id")
+    # if fallback_id:
+    #     return fallback_id
+        
+    # raise HTTPException(status_code=401, detail="Unauthorized: Missing or invalid authentication token.")
 
 # ==========================================
 # PYDANTIC SCHEMAS
@@ -293,7 +299,7 @@ def execute_draft_plan(user_id: str, conv_id: str, args: ToolDraftWorkoutPlan) -
                 text("INSERT INTO pending_actions (token, user_id, conversation_id, action_type, payload) VALUES (:token, :uid, :cid, 'create_plan', :payload)"),
                 {"token": token, "uid": user_id, "cid": conv_id, "payload": json.dumps(db_json)}
             )
-        return {"success": True, "confirmation_token": token, "message": "Plan drafted. Ask user to approve."}
+        return {"success": True, "message": "Plan drafted successfully. The proposed plan has been prepared for your review."}
     except Exception as e: return _safe_db_error(e, "draft_plan")
 
 def execute_commit_plan(user_id: str, conv_id: str, args: ToolCommitWorkoutPlan) -> dict:
@@ -324,8 +330,15 @@ def execute_commit_plan(user_id: str, conv_id: str, args: ToolCommitWorkoutPlan)
     except Exception as e: return _safe_db_error(e, "commit_plan")
 
 def execute_draft_modification(user_id: str, conv_id: str, args: ToolDraftPlanModification) -> dict:
+    # Force fetch active plan from database
     active = execute_get_active_plan(user_id)
-    if not active.get("success"): return active
+    if not active.get("success"): 
+        return {"success": False, "error_code": "NO_ACTIVE_PLAN", "message": "Cannot modify plan: No active plan found"}
+    
+    # Re-fetch to ensure fresh state
+    active = execute_get_active_plan(user_id)
+    if not active.get("success"): 
+        return active
     
     plan_json = active["plan_json"]
     base_version = active["version"]
@@ -345,7 +358,7 @@ def execute_draft_modification(user_id: str, conv_id: str, args: ToolDraftPlanMo
                 text("INSERT INTO pending_actions (token, user_id, conversation_id, action_type, payload) VALUES (:token, :uid, :cid, 'modify_plan', :payload)"),
                 {"token": token, "uid": user_id, "cid": conv_id, "payload": json.dumps(payload)}
             )
-        return {"success": True, "confirmation_token": token, "projected_affected_days": list(affected_days), "proposed_operations": ops_dicts}
+        return {"success": True, "message": "Plan modifications drafted. The proposed changes have been prepared for your review.", "affected_days": list(affected_days)}
     except Exception as e: return _safe_db_error(e, "draft_modification")
 
 def execute_commit_modification(user_id: str, conv_id: str, args: ToolCommitPlanModification) -> dict:
@@ -400,7 +413,9 @@ def execute_get_recent_sessions(user_id: str, args: ToolGetRecentWorkoutSessions
 def execute_analyze_exercise_trend(user_id: str, args: ToolGetExerciseTrend) -> dict:
     try:
         with engine.connect() as conn:
-            rows = conn.execute(text("SELECT form_score, dominant_deviation, created_at FROM workout_sessions WHERE user_id = :uid AND activity_key = :key ORDER BY created_at ASC LIMIT :limit"), {"uid": user_id, "key": args.activity_key, "limit": args.limit}).mappings().fetchall()
+            rows = conn.execute(text("SELECT form_score, dominant_deviation, created_at FROM workout_sessions WHERE user_id = :uid AND activity_key = :key ORDER BY created_at DESC LIMIT :limit"), {"uid": user_id, "key": args.activity_key, "limit": args.limit}).mappings().fetchall()
+            # Reverse to maintain chronological order for analysis
+            rows = list(reversed(rows))
         if not rows: return {"success": True, "message": "No empirical data found"}
         
         recent_3 = rows[-3:]
@@ -531,14 +546,15 @@ class AgentState(TypedDict):
 
 def agent_node(state: AgentState):
     sys_prompt = f"""You are CoachSaab, an autonomous AI fitness agent.
-    
-    {state.get("user_context", "")}
-    
-    GUARDRAILS:
-    1. PROPOSE BEFORE EXECUTION: For ANY plan creation or modification, use `ToolDraft...` first to present proposed changes. ONLY when confirmed may you call `ToolCommit...`.
-    2. EMPIRICAL ANALYSIS: Base feedback on real data via analytical tools, not hallucinated assumptions.
-    3. FORMATTING: Clean bullet points only. NO HTML tags like <br>. NO Markdown tables. NO <think> tags.
-    """
+        
+        {state.get("user_context", "")}
+        
+        GUARDRAILS:
+        1. PROPOSE BEFORE EXECUTION: For ANY plan creation or modification, use `ToolDraft...` first to present proposed changes. ONLY when confirmed may you call `ToolCommit...`.
+        2. EMPIRICAL ANALYSIS: Base feedback on real data via analytical tools, not hallucinated assumptions.
+        3. FORMATTING: Clean bullet points only. NO HTML tags like <br>. NO Markdown tables. NO <think> tags.
+        4. PRIVACY: Never expose database IDs, tokens, or backend implementation details to the user. Hide all UUIDs and internal identifiers.
+        """
     messages = [SystemMessage(content=sys_prompt)] + state["messages"]
     response = llm_with_tools.invoke(messages)
     return {"messages": [response], "agent_steps": 1}
@@ -615,10 +631,17 @@ def get_dashboard_data(user_id: str, timeframe: str = "This Week", auth_user_id:
     """Generates empirically grounded analytical data for the Flutter Reports tab based on explicit timeframes."""
     if user_id != auth_user_id: raise HTTPException(403, "Forbidden")
     
-    interval_str = '7 days'
-    if timeframe == "This Month": interval_str = '30 days'
-    elif timeframe == "Last 4 Weeks": interval_str = '28 days'
-    elif timeframe == "All Time": interval_str = '100 years'
+    # Map timeframe to proper interval
+    if timeframe == "This Week":
+        interval_str = "7 days"
+    elif timeframe == "This Month":
+        interval_str = "30 days"
+    elif timeframe == "Last 4 Weeks":
+        interval_str = "28 days"
+    elif timeframe == "All Time":
+        interval_str = "36500 days"  # ~100 years
+    else:
+        interval_str = "7 days"  # Default to This Week
     
     cons_data = execute_get_consistency(user_id)
     consistency_rate = cons_data.get("overall_completion_rate", "0%")
