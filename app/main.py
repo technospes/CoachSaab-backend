@@ -1,16 +1,17 @@
-from fastapi import FastAPI, HTTPException, Request, Depends, Header
+from fastapi import FastAPI, HTTPException, Request, Depends, Header, status
 from pydantic import BaseModel, Field, EmailStr
 from sqlalchemy import create_engine, text
-from typing import Optional, List, Annotated, Literal, Union
+from typing import Optional, List, Annotated, Literal, Union, Any
 import os
 import json
 import re
 import uuid
+import secrets
 import operator
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 from dotenv import load_dotenv
 from typing_extensions import TypedDict
-import jwt  
+import jwt
 from pwdlib import PasswordHash
 from pwdlib.hashers.argon2 import Argon2Hasher
 from langgraph.graph import StateGraph, START, END
@@ -18,9 +19,19 @@ from langgraph.graph.message import add_messages
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_groq import ChatGroq
 
+# NEW: Rate Limiting
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+
 load_dotenv()
 
 app = FastAPI(title="CoachSaab API", version="11.0-Enterprise-Analytics-Agent")
+
+# Initialize Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
+app.state.limiter = limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
 DATABASE_URL = os.getenv("DATABASE_URL", "")
 engine = create_engine(DATABASE_URL)
@@ -37,9 +48,8 @@ if not JWT_SECRET_KEY:
     raise RuntimeError("CRITICAL SECURITY ERROR: JWT_SECRET_KEY is not configured in environment variables.")
 
 JWT_ALGORITHM = "HS256"
-ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7  # 7 Days for "Remember Me" MVP
+ACCESS_TOKEN_EXPIRE_MINUTES = 60 * 24 * 7
 
-# Configure Argon2 Password Hasher
 password_hash = PasswordHash((Argon2Hasher(),))
 
 def verify_password(plain_password: str, hashed_password: str) -> bool:
@@ -89,9 +99,34 @@ def startup_event():
         conn.execute(text("ALTER TABLE workout_plans ADD COLUMN IF NOT EXISTS version INT DEFAULT 1;"))
         conn.execute(text("ALTER TABLE pending_actions ADD COLUMN IF NOT EXISTS conversation_id UUID;"))
         
-        # Security Schema Updates (Safe to run multiple times)
+        # Identity / Auth Schema
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT UNIQUE;"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;"))
+        
+        # OTP Verification Schema & Rate Limiting
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT false;"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_secret TEXT;"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMPTZ;"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_attempts INT DEFAULT 0;"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_last_sent_at TIMESTAMPTZ;"))
+        
+        # NEW: Onboarding State
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT false;"))
+
+# ==========================================
+# OTP UTILITIES & EMAIL SIMULATION
+# ==========================================
+def generate_secure_otp() -> str:
+    return ''.join(str(secrets.randbelow(10)) for _ in range(6))
+
+def send_otp_email(email: str, otp_code: str, name: str):
+    print(f"\n{'='*50}")
+    print(f"📧 SIMULATED EMAIL DELIVERY")
+    print(f"To: {email}")
+    print(f"Subject: Verify your CoachSaab Account")
+    print(f"Body: Hi {name},\n\nYour 6-digit verification code is: {otp_code}")
+    print(f"This code will expire in 10 minutes.")
+    print(f"{'='*50}\n")
 
 # ==========================================
 # AUTHENTICATION ENDPOINTS
@@ -105,35 +140,142 @@ class UserLogin(BaseModel):
     email: EmailStr
     password: str
 
+class OTPVerify(BaseModel):
+    email: EmailStr
+    otp: str
+
+class OTPResend(BaseModel):
+    email: EmailStr
+
 @app.post("/api/v1/auth/register")
 def register_user(user: UserRegister):
     hashed_password = get_password_hash(user.password)
+    
+    raw_otp = generate_secure_otp()
+    hashed_otp = get_password_hash(raw_otp)
+    now = datetime.now(timezone.utc)
+    otp_expiry = now + timedelta(minutes=10)
+
     try:
         with engine.begin() as conn:
-            query = text("INSERT INTO users (name, email, password_hash) VALUES (:name, :email, :hash) RETURNING user_id, name")
-            result = conn.execute(query, {"name": user.name, "email": user.email.lower(), "hash": hashed_password}).mappings().fetchone()
+            query = text("""
+                INSERT INTO users (name, email, password_hash, email_verified, otp_secret, otp_expires_at, otp_attempts, otp_last_sent_at, onboarding_completed) 
+                VALUES (:name, :email, :hash, false, :otp_hash, :otp_exp, 0, :last_sent, false) 
+                RETURNING user_id, name
+            """)
+            result = conn.execute(query, {
+                "name": user.name, 
+                "email": user.email.lower(), 
+                "hash": hashed_password,
+                "otp_hash": hashed_otp,
+                "otp_exp": otp_expiry,
+                "last_sent": now
+            }).mappings().fetchone()
             
             user_id = str(result["user_id"])
-            access_token = create_access_token(data={"sub": user_id}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+            send_otp_email(user.email.lower(), raw_otp, result["name"])
             
             return {
-                "access_token": access_token, 
-                "token_type": "bearer",
+                "status": "success",
+                "message": "Account created. Please check your email for the verification code.",
                 "user": {"user_id": user_id, "name": result["name"], "email": user.email}
             }
+            
     except Exception as e:
         if "unique constraint" in str(e).lower():
             raise HTTPException(status_code=400, detail="Email already registered")
         raise HTTPException(status_code=500, detail="Database error")
 
+@app.post("/api/v1/auth/verify-otp")
+@limiter.limit("10/minute") # IP-based rate limiting
+def verify_otp(request: Request, payload: OTPVerify):
+    with engine.connect() as conn:
+        query = text("SELECT user_id, name, otp_secret, otp_expires_at, email_verified, otp_attempts FROM users WHERE email = :email")
+        row = conn.execute(query, {"email": payload.email.lower()}).mappings().fetchone()
+        
+    # Enumeration Protection: Generic error
+    if not row:
+        raise HTTPException(status_code=401, detail="Invalid email or verification code.")
+        
+    if row["email_verified"]:
+        return {"status": "success", "message": "Email is already verified. You can log in."}
+        
+    if row["otp_attempts"] >= 5:
+        raise HTTPException(status_code=429, detail="Too many failed attempts. Please request a new code.")
+        
+    if row["otp_expires_at"].replace(tzinfo=timezone.utc) < datetime.now(timezone.utc):
+        raise HTTPException(status_code=400, detail="OTP has expired. Please request a new one.")
+        
+    if not verify_password(payload.otp, row["otp_secret"]):
+        with engine.begin() as conn:
+            conn.execute(text("UPDATE users SET otp_attempts = otp_attempts + 1 WHERE user_id = :uid"), {"uid": row["user_id"]})
+        raise HTTPException(status_code=401, detail="Invalid verification code.")
+        
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE users SET email_verified = true, otp_secret = NULL, otp_expires_at = NULL, otp_attempts = 0 WHERE user_id = :uid"),
+            {"uid": row["user_id"]}
+        )
+        
+    user_id = str(row["user_id"])
+    access_token = create_access_token(data={"sub": user_id}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+    
+    return {
+        "access_token": access_token, 
+        "token_type": "bearer",
+        "message": "Email verified successfully.",
+        "user": {"user_id": user_id, "name": row["name"], "email": payload.email}
+    }
+
+@app.post("/api/v1/auth/resend-otp")
+@limiter.limit("5/hour") # Restrict resends to prevent SMS/Email spam
+def resend_otp(request: Request, payload: OTPResend):
+    with engine.connect() as conn:
+        query = text("SELECT user_id, name, email_verified, otp_last_sent_at FROM users WHERE email = :email")
+        row = conn.execute(query, {"email": payload.email.lower()}).mappings().fetchone()
+        
+    # Enumeration Protection: Return success even if email doesn't exist
+    generic_success = {"status": "success", "message": "If an account exists and is unverified, a new code has been sent."}
+    
+    if not row or row["email_verified"]:
+        return generic_success
+        
+    now = datetime.now(timezone.utc)
+    
+    # Cooldown Protection
+    if row["otp_last_sent_at"]:
+        seconds_since_last = (now - row["otp_last_sent_at"].replace(tzinfo=timezone.utc)).total_seconds()
+        if seconds_since_last < 60:
+            return generic_success # Generic response prevents leaking info
+        
+    raw_otp = generate_secure_otp()
+    hashed_otp = get_password_hash(raw_otp)
+    otp_expiry = now + timedelta(minutes=10)
+    
+    with engine.begin() as conn:
+        conn.execute(
+            text("UPDATE users SET otp_secret = :otp_hash, otp_expires_at = :otp_exp, otp_attempts = 0, otp_last_sent_at = :last_sent WHERE user_id = :uid"),
+            {"otp_hash": hashed_otp, "otp_exp": otp_expiry, "last_sent": now, "uid": row["user_id"]}
+        )
+        
+    send_otp_email(payload.email.lower(), raw_otp, row["name"])
+    return generic_success
+
 @app.post("/api/v1/auth/login")
 def login_user(credentials: UserLogin):
     with engine.connect() as conn:
-        query = text("SELECT user_id, name, password_hash FROM users WHERE email = :email")
+        query = text("SELECT user_id, name, password_hash, email_verified FROM users WHERE email = :email")
         row = conn.execute(query, {"email": credentials.email.lower()}).mappings().fetchone()
         
     if not row or not verify_password(credentials.password, row["password_hash"]):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
+        
+    # Prevent login if email is not verified
+    if not row["email_verified"]:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, 
+            detail="unverified_email"
+        )
         
     user_id = str(row["user_id"])
     access_token = create_access_token(data={"sub": user_id}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
@@ -146,12 +288,14 @@ def login_user(credentials: UserLogin):
 
 @app.get("/api/v1/auth/me")
 def get_current_user(auth_user_id: str = Depends(get_current_user_id)):
+    """Returns core identity AND routing flags (verified, onboarding status)"""
     with engine.connect() as conn:
-        query = text("SELECT user_id, name, email FROM users WHERE user_id = :uid")
+        query = text("SELECT user_id, name, email, email_verified, onboarding_completed FROM users WHERE user_id = :uid")
         row = conn.execute(query, {"uid": auth_user_id}).mappings().fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
     return dict(row)
+
 
 # ==========================================
 # PYDANTIC SCHEMAS (Existing)
@@ -807,6 +951,11 @@ def update_user_profile_endpoint(user_id: str, payload: dict, auth_user_id: str 
     )
     res = execute_update_profile(auth_user_id, args)
     if not res.get("success"): raise HTTPException(status_code=400, detail=res)
+    
+    # NEW: Flag onboarding as complete
+    with engine.begin() as conn:
+        conn.execute(text("UPDATE users SET onboarding_completed = true WHERE user_id = :uid"), {"uid": auth_user_id})
+        
     return res
 
 @app.post("/api/v1/sessions")
@@ -907,7 +1056,6 @@ def add_chat_message(conversation_id: str, message: ChatMessageCreate, auth_user
     response_dict = dict(result)
     response_dict['content'] = clean_ai_response(response_dict['content'])
     
-    # 2. POST-TOOL CONTEXT REFRESH INJECTION
     if "updated" in ai_reply.lower() or "drafted" in ai_reply.lower() or "committed" in ai_reply.lower():
         response_dict['content'] += "\n\n*(Note: Your profile/plan state has been successfully synced to the database.)*"
         
