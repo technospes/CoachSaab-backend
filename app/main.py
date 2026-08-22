@@ -19,14 +19,18 @@ from langgraph.graph.message import add_messages
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_groq import ChatGroq
 
-# NEW: Rate Limiting
+# Google Auth
+from google.oauth2 import id_token
+from google.auth.transport import requests as google_requests
+
+# Rate Limiting
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
 
 load_dotenv()
 
-app = FastAPI(title="CoachSaab API", version="11.0-Enterprise-Analytics-Agent")
+app = FastAPI(title="CoachSaab API", version="11.1-Enterprise-Google-Auth")
 
 # Initialize Rate Limiter
 limiter = Limiter(key_func=get_remote_address)
@@ -44,6 +48,8 @@ llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.2)
 # 1. STRICT JWT AUTHENTICATION & HASHING
 # ==========================================
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
+GOOGLE_WEB_CLIENT_ID = os.getenv("GOOGLE_WEB_CLIENT_ID")
+
 if not JWT_SECRET_KEY:
     raise RuntimeError("CRITICAL SECURITY ERROR: JWT_SECRET_KEY is not configured in environment variables.")
 
@@ -103,15 +109,20 @@ def startup_event():
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS email TEXT UNIQUE;"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS password_hash TEXT;"))
         
-        # OTP Verification Schema & Rate Limiting
+        # OTP Verification Schema
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS email_verified BOOLEAN DEFAULT false;"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_secret TEXT;"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_expires_at TIMESTAMPTZ;"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_attempts INT DEFAULT 0;"))
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS otp_last_sent_at TIMESTAMPTZ;"))
         
-        # NEW: Onboarding State
+        # Onboarding State
         conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS onboarding_completed BOOLEAN DEFAULT false;"))
+        
+        # Google Auth Schema (Failsafes in case alembic wasn't run)
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS auth_provider TEXT DEFAULT 'email';"))
+        conn.execute(text("ALTER TABLE users ADD COLUMN IF NOT EXISTS google_sub TEXT UNIQUE;"))
+        conn.execute(text("ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL;"))
 
 # ==========================================
 # OTP UTILITIES & EMAIL SIMULATION
@@ -147,6 +158,66 @@ class OTPVerify(BaseModel):
 class OTPResend(BaseModel):
     email: EmailStr
 
+class GoogleAuthRequest(BaseModel):
+    id_token: str
+
+@app.post("/api/v1/auth/google")
+def google_auth(payload: GoogleAuthRequest):
+    if not GOOGLE_WEB_CLIENT_ID:
+        raise HTTPException(status_code=500, detail="Server misconfiguration: Google Auth not enabled.")
+        
+    try:
+        # 1. Securely verify the token with Google
+        idinfo = id_token.verify_oauth2_token(
+            payload.id_token, google_requests.Request(), GOOGLE_WEB_CLIENT_ID
+        )
+        
+        email = idinfo['email'].lower()
+        name = idinfo.get('name', 'User')
+        google_sub = idinfo['sub']
+        
+        with engine.begin() as conn:
+            # 2. Check if user already exists
+            query = text("SELECT user_id, auth_provider, onboarding_completed FROM users WHERE email = :email")
+            row = conn.execute(query, {"email": email}).mappings().fetchone()
+            
+            if row:
+                user_id = str(row["user_id"])
+                onboarding_completed = row["onboarding_completed"]
+                
+                # Graceful Linking: If they signed up with email previously but now used Google
+                if row["auth_provider"] == "email":
+                    conn.execute(
+                        text("UPDATE users SET auth_provider = 'google', google_sub = :sub, email_verified = true WHERE user_id = :uid"),
+                        {"sub": google_sub, "uid": user_id}
+                    )
+            else:
+                # 3. Create a brand new user
+                query = text("""
+                    INSERT INTO users (name, email, auth_provider, google_sub, email_verified, onboarding_completed) 
+                    VALUES (:name, :email, 'google', :sub, true, false) 
+                    RETURNING user_id
+                """)
+                result = conn.execute(query, {"name": name, "email": email, "sub": google_sub}).mappings().fetchone()
+                user_id = str(result["user_id"])
+                onboarding_completed = False
+                
+        # 4. Generate our own CoachSaab JWT to maintain session securely
+        access_token = create_access_token(data={"sub": user_id}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
+        
+        # 5. Return everything the Flutter frontend needs to route the user
+        return {
+            "access_token": access_token, 
+            "token_type": "bearer",
+            "message": "Google authentication successful.",
+            "user": {"user_id": user_id, "name": name, "email": email},
+            "onboarding_completed": onboarding_completed
+        }
+        
+    except ValueError:
+        # Invalid token (expired, wrong audience, tampered)
+        raise HTTPException(status_code=401, detail="Invalid or expired Google authentication token.")
+
 @app.post("/api/v1/auth/register")
 def register_user(user: UserRegister):
     hashed_password = get_password_hash(user.password)
@@ -159,8 +230,8 @@ def register_user(user: UserRegister):
     try:
         with engine.begin() as conn:
             query = text("""
-                INSERT INTO users (name, email, password_hash, email_verified, otp_secret, otp_expires_at, otp_attempts, otp_last_sent_at, onboarding_completed) 
-                VALUES (:name, :email, :hash, false, :otp_hash, :otp_exp, 0, :last_sent, false) 
+                INSERT INTO users (name, email, password_hash, auth_provider, email_verified, otp_secret, otp_expires_at, otp_attempts, otp_last_sent_at, onboarding_completed) 
+                VALUES (:name, :email, :hash, 'email', false, :otp_hash, :otp_exp, 0, :last_sent, false) 
                 RETURNING user_id, name
             """)
             result = conn.execute(query, {
@@ -187,13 +258,12 @@ def register_user(user: UserRegister):
         raise HTTPException(status_code=500, detail="Database error")
 
 @app.post("/api/v1/auth/verify-otp")
-@limiter.limit("10/minute") # IP-based rate limiting
+@limiter.limit("10/minute") 
 def verify_otp(request: Request, payload: OTPVerify):
     with engine.connect() as conn:
         query = text("SELECT user_id, name, otp_secret, otp_expires_at, email_verified, otp_attempts FROM users WHERE email = :email")
         row = conn.execute(query, {"email": payload.email.lower()}).mappings().fetchone()
         
-    # Enumeration Protection: Generic error
     if not row:
         raise HTTPException(status_code=401, detail="Invalid email or verification code.")
         
@@ -228,25 +298,19 @@ def verify_otp(request: Request, payload: OTPVerify):
     }
 
 @app.post("/api/v1/auth/resend-otp")
-@limiter.limit("5/hour") # Restrict resends to prevent SMS/Email spam
+@limiter.limit("5/hour") 
 def resend_otp(request: Request, payload: OTPResend):
     with engine.connect() as conn:
         query = text("SELECT user_id, name, email_verified, otp_last_sent_at FROM users WHERE email = :email")
         row = conn.execute(query, {"email": payload.email.lower()}).mappings().fetchone()
         
-    # Enumeration Protection: Return success even if email doesn't exist
     generic_success = {"status": "success", "message": "If an account exists and is unverified, a new code has been sent."}
-    
-    if not row or row["email_verified"]:
-        return generic_success
+    if not row or row["email_verified"]: return generic_success
         
     now = datetime.now(timezone.utc)
-    
-    # Cooldown Protection
     if row["otp_last_sent_at"]:
         seconds_since_last = (now - row["otp_last_sent_at"].replace(tzinfo=timezone.utc)).total_seconds()
-        if seconds_since_last < 60:
-            return generic_success # Generic response prevents leaking info
+        if seconds_since_last < 60: return generic_success 
         
     raw_otp = generate_secure_otp()
     hashed_otp = get_password_hash(raw_otp)
@@ -264,18 +328,21 @@ def resend_otp(request: Request, payload: OTPResend):
 @app.post("/api/v1/auth/login")
 def login_user(credentials: UserLogin):
     with engine.connect() as conn:
-        query = text("SELECT user_id, name, password_hash, email_verified FROM users WHERE email = :email")
+        query = text("SELECT user_id, name, password_hash, email_verified, auth_provider FROM users WHERE email = :email")
         row = conn.execute(query, {"email": credentials.email.lower()}).mappings().fetchone()
         
-    if not row or not verify_password(credentials.password, row["password_hash"]):
+    if not row:
         raise HTTPException(status_code=401, detail="Incorrect email or password")
         
-    # Prevent login if email is not verified
+    # Prevent traditional login if they used Google and have no password
+    if row["auth_provider"] == "google" and not row["password_hash"]:
+        raise HTTPException(status_code=401, detail="Please use 'Sign in with Google' for this account.")
+        
+    if not verify_password(credentials.password, row["password_hash"]):
+        raise HTTPException(status_code=401, detail="Incorrect email or password")
+        
     if not row["email_verified"]:
-        raise HTTPException(
-            status_code=status.HTTP_403_FORBIDDEN, 
-            detail="unverified_email"
-        )
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="unverified_email")
         
     user_id = str(row["user_id"])
     access_token = create_access_token(data={"sub": user_id}, expires_delta=timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
@@ -288,9 +355,8 @@ def login_user(credentials: UserLogin):
 
 @app.get("/api/v1/auth/me")
 def get_current_user(auth_user_id: str = Depends(get_current_user_id)):
-    """Returns core identity AND routing flags (verified, onboarding status)"""
     with engine.connect() as conn:
-        query = text("SELECT user_id, name, email, email_verified, onboarding_completed FROM users WHERE user_id = :uid")
+        query = text("SELECT user_id, name, email, auth_provider, email_verified, onboarding_completed FROM users WHERE user_id = :uid")
         row = conn.execute(query, {"uid": auth_user_id}).mappings().fetchone()
     if not row:
         raise HTTPException(status_code=404, detail="User not found")
