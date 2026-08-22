@@ -13,3 +13,5 @@ alembic
 pwdlib[argon2]
 PyJWT
 slowapi
+google-auth
+requests
