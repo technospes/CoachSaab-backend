@@ -977,6 +977,69 @@ def get_active_plan(user_id: str, auth_user_id: str = Depends(get_current_user_i
     if not res.get("success"): return {"status": "no_active_plan"}
     return {"plan_id": res["plan_id"], "plan_name": res["plan_name"], "plan_json": res["plan_json"], "user_id": auth_user_id}
 
+
+@app.get("/api/v1/users/{user_id}/sessions")
+def get_session_history(
+    user_id: str, 
+    limit: int = 20, 
+    cursor: Optional[str] = None, 
+    auth_user_id: str = Depends(get_current_user_id)
+):
+    # 1. Enforce strict authentication[cite: 27]
+    if user_id != auth_user_id: 
+        raise HTTPException(status_code=403, detail="Forbidden")
+        
+    try:
+        with engine.connect() as conn:
+            # 2. Build the query dynamically. 
+            # We explicitly exclude the heavy deviations_json and rep_results columns to keep the API blazing fast[cite: 21, 27].
+            if cursor:
+                query = text("""
+                    SELECT session_id, activity_key, reps, duration_seconds, 
+                           form_score, dominant_deviation, created_at 
+                    FROM workout_sessions 
+                    WHERE user_id = :uid AND created_at < :cursor
+                    ORDER BY created_at DESC 
+                    LIMIT :limit
+                """)
+                params = {"uid": user_id, "cursor": cursor, "limit": limit}
+            else:
+                query = text("""
+                    SELECT session_id, activity_key, reps, duration_seconds, 
+                           form_score, dominant_deviation, created_at 
+                    FROM workout_sessions 
+                    WHERE user_id = :uid 
+                    ORDER BY created_at DESC 
+                    LIMIT :limit
+                """)
+                params = {"uid": user_id, "limit": limit}
+            
+            rows = conn.execute(query, params).mappings().fetchall()
+            
+        # 3. Format the data for JSON serialization
+        sessions = []
+        for r in rows:
+            session_dict = dict(r)
+            session_dict["session_id"] = str(session_dict["session_id"])
+            session_dict["created_at"] = session_dict["created_at"].isoformat()
+            sessions.append(session_dict)
+            
+        # 4. Determine the Next Cursor for pagination
+        next_cursor = None
+        if len(sessions) == limit and len(sessions) > 0:
+            next_cursor = sessions[-1]["created_at"]
+            
+        return {
+            "status": "success",
+            "count": len(sessions),
+            "sessions": sessions,
+            "next_cursor": next_cursor
+        }
+        
+    except Exception as e:
+        print(f"Error fetching session history: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve session history")
+
 @app.get("/api/v1/users/{user_id}/sessions/recent")
 def get_recent_session(user_id: str, auth_user_id: str = Depends(get_current_user_id)):
     if user_id != auth_user_id: raise HTTPException(403, "Forbidden")
