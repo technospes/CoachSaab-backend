@@ -454,8 +454,8 @@ class ToolGetDetailedSessionReport(BaseModel):
     activity_key: Optional[str] = Field(
         None,
         description=(
-            "Exercise/activity key to retrieve the user's latest matching "
-            "session, such as 'squats' or 'tree_pose'. "
+            "Exercise/activity key to retrieve. MUST be singular and snake_case "
+            "(e.g., 'squat' NOT 'squats', 'pushup' NOT 'push_ups'). "
             "Use null when the user asks about their latest session generally."
         )
     )
@@ -810,14 +810,19 @@ def execute_get_detailed_session_report(user_id: str, args: ToolGetDetailedSessi
     try:
         with engine.connect() as conn:
             if args.activity_key:
-                # 🚀 EXACT match, no fuzzy ILIKE
+                # 🚀 NORMALIZE THE KEY: lowercase, strip spaces, and remove trailing 's' 
+                # (unless it's a word that naturally ends in 's' like 'press')
+                normalized_key = args.activity_key.lower().strip()
+                if normalized_key.endswith('s') and not normalized_key.endswith('ss'):
+                    normalized_key = normalized_key[:-1]
+                
                 query = text("""
                     SELECT activity_key, reps, duration_seconds, form_score, dominant_deviation, deviations_json, created_at 
                     FROM workout_sessions 
                     WHERE user_id = :uid AND activity_key = :key 
                     ORDER BY created_at DESC LIMIT 1
                 """)
-                row = conn.execute(query, {"uid": user_id, "key": args.activity_key}).mappings().fetchone()
+                row = conn.execute(query, {"uid": user_id, "key": normalized_key}).mappings().fetchone()
             else:
                 query = text("""
                     SELECT activity_key, reps, duration_seconds, form_score, dominant_deviation, deviations_json, created_at 
