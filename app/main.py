@@ -933,7 +933,7 @@ def execute_tools_node(state: AgentState):
         except Exception as e:
             res = {"success": False, "error_code": "TOOL_CRASH", "message": str(e)}
             
-        tool_messages.append(ToolMessage(content=json.dumps(res), name=name, tool_call_id=call_id))
+        tool_messages.append(ToolMessage(content=json.dumps(res, default=str), name=name, tool_call_id=call_id))
 
     return {"messages": tool_messages}
 
