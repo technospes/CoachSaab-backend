@@ -450,6 +450,16 @@ class ToolUpdateUserProfile(BaseModel):
 
 class ToolGetActivePlan(BaseModel): pass
 
+class ToolGetDetailedSessionReport(BaseModel):
+    activity_key: Optional[str] = Field(
+        None,
+        description=(
+            "Exercise/activity key to retrieve the user's latest matching "
+            "session, such as 'squats' or 'tree_pose'. "
+            "Use null when the user asks about their latest session generally."
+        )
+    )
+
 class ToolDraftWorkoutPlan(BaseModel):
     duration_weeks: int = Field(..., description="Length of plan (2-12)")
     goal: str = Field(..., description="Primary objective")
@@ -482,7 +492,7 @@ agent_tools = [
     ToolGetUserProfile, ToolUpdateUserProfile, ToolGetActivePlan, 
     ToolDraftWorkoutPlan, ToolCommitWorkoutPlan, ToolDraftPlanModification, ToolCommitPlanModification, 
     ToolGetPlanProgress, ToolGetRecentWorkoutSessions, ToolGetExerciseTrend, ToolGetConsistencyStats,
-    ToolGetPendingActions
+    ToolGetPendingActions, ToolGetDetailedSessionReport
 ]
 llm_with_tools = llm.bind_tools(agent_tools)
 
@@ -795,6 +805,46 @@ def execute_get_consistency(user_id: str) -> dict:
         }
     except Exception as e: return _safe_db_error(e, "consistency")
 
+
+def execute_get_detailed_session_report(user_id: str, args: ToolGetDetailedSessionReport) -> dict:
+    try:
+        with engine.connect() as conn:
+            if args.activity_key:
+                # 🚀 EXACT match, no fuzzy ILIKE
+                query = text("""
+                    SELECT activity_key, reps, duration_seconds, form_score, dominant_deviation, deviations_json, created_at 
+                    FROM workout_sessions 
+                    WHERE user_id = :uid AND activity_key = :key 
+                    ORDER BY created_at DESC LIMIT 1
+                """)
+                row = conn.execute(query, {"uid": user_id, "key": args.activity_key}).mappings().fetchone()
+            else:
+                query = text("""
+                    SELECT activity_key, reps, duration_seconds, form_score, dominant_deviation, deviations_json, created_at 
+                    FROM workout_sessions 
+                    WHERE user_id = :uid 
+                    ORDER BY created_at DESC LIMIT 1
+                """)
+                row = conn.execute(query, {"uid": user_id}).mappings().fetchone()
+                
+        if not row: 
+            return {"success": False, "message": "No recent session found matching that criteria."}
+            
+        return {
+            "success": True,
+            "session": {
+                "activity": row["activity_key"],
+                "reps": row["reps"],
+                "duration_seconds": row["duration_seconds"],
+                "form_score": row["form_score"],
+                "date": str(row["created_at"])
+            },
+            "rep_summary": row["deviations_json"] # The structured JSON saved directly from Flutter
+        }
+    except Exception as e: 
+        return _safe_db_error(e, "get_detailed_session_report")
+
+
 def execute_get_pending_actions(user_id: str, conv_id: str) -> dict:
     try:
         with engine.connect() as conn:
@@ -814,19 +864,46 @@ class AgentState(TypedDict):
     user_context: str
 
 def agent_node(state: AgentState):
-    sys_prompt = f"""You are CoachSaab, an autonomous AI fitness agent.
+    sys_prompt = f"""You are CoachSaab, an elite, highly professional AI fitness trainer.
         
         {state.get("user_context", "")}
         
-        GUARDRAILS:
-        1. PROPOSE BEFORE EXECUTION: For ANY plan creation or modification, use `ToolDraft...` first to present proposed changes. ONLY when confirmed may you call `ToolCommit...`.
-        2. EMPIRICAL ANALYSIS: Base feedback on real data via analytical tools, not hallucinated assumptions.
-        3. FORMATTING: Clean bullet points only. NO HTML tags like <br>. NO Markdown tables. NO <think> tags.
-        4. PRIVACY: Never expose database IDs, tokens, or backend implementation details to the user. Hide all UUIDs and internal identifiers.
+        GUARDRAILS & BEHAVIOR:
+        1. PROPOSE BEFORE EXECUTION: For ANY plan creation or modification, use `ToolDraft...` first.
+        2. FORMATTING: Clean bullet points only. NO HTML tags like <br>. NO Markdown tables. NO <think> tags.
+        3. PRIVACY: Never expose database IDs, tokens, or backend implementation details.
+        
+        SESSION ANALYSIS & COACHING PROTOCOL:
+        When the user asks about a specific workout/session:
+        - Retrieve the relevant session using `ToolGetDetailedSessionReport`.
+        - NEVER invent reps, scores, deviations, or measurements.
+        - Treat the returned session data as authoritative for what occurred.
+        - Use the user's profile and goals to contextualize the analysis (e.g., if their goal is muscle mass, explain why depth matters).
+        - Identify specific rep numbers when the data supports it.
+        - Distinguish measured facts from coaching interpretation.
+        - If the report does not contain enough information to explain why something happened, state that rather than inventing a biomechanical cause.
+        - Give actionable coaching cues appropriate to the user's goal.
+        - Compare against previous sessions ONLY when historical data has actually been retrieved via `ToolGetExerciseTrend`.
         """
     messages = [SystemMessage(content=sys_prompt)] + state["messages"]
     response = llm_with_tools.invoke(messages)
     return {"messages": [response], "agent_steps": 1}
+
+TOOL_EXECUTORS = {
+    "ToolGetUserProfile": lambda uid, args: execute_get_profile(uid),
+    "ToolUpdateUserProfile": lambda uid, args: execute_update_profile(uid, ToolUpdateUserProfile(**args)),
+    "ToolGetActivePlan": lambda uid, args: execute_get_active_plan(uid),
+    "ToolDraftWorkoutPlan": lambda uid, args: execute_draft_plan(uid, args["_conv_id"], ToolDraftWorkoutPlan(**args)),
+    "ToolCommitWorkoutPlan": lambda uid, args: execute_commit_plan(uid, args["_conv_id"], ToolCommitWorkoutPlan(**args)),
+    "ToolDraftPlanModification": lambda uid, args: execute_draft_modification(uid, args["_conv_id"], ToolDraftPlanModification(**args)),
+    "ToolCommitPlanModification": lambda uid, args: execute_commit_modification(uid, args["_conv_id"], ToolCommitPlanModification(**args)),
+    "ToolGetPlanProgress": lambda uid, args: execute_get_progress(uid),
+    "ToolGetRecentWorkoutSessions": lambda uid, args: execute_get_recent_sessions(uid, ToolGetRecentWorkoutSessions(**args)),
+    "ToolGetExerciseTrend": lambda uid, args: execute_analyze_exercise_trend(uid, ToolGetExerciseTrend(**args)),
+    "ToolGetConsistencyStats": lambda uid, args: execute_get_consistency(uid),
+    "ToolGetPendingActions": lambda uid, args: execute_get_pending_actions(uid, args["_conv_id"]),
+    "ToolGetDetailedSessionReport": lambda uid, args: execute_get_detailed_session_report(uid, ToolGetDetailedSessionReport(**args))
+}
 
 def execute_tools_node(state: AgentState):
     last_msg = state["messages"][-1]
@@ -839,20 +916,15 @@ def execute_tools_node(state: AgentState):
         args = tool_call["args"]
         call_id = tool_call["id"]
         
+        # Inject conversation ID safely into args if the tool needs it
+        args["_conv_id"] = conv_id 
+        
         try:
-            if name == "ToolGetUserProfile": res = execute_get_profile(user_id)
-            elif name == "ToolUpdateUserProfile": res = execute_update_profile(user_id, ToolUpdateUserProfile(**args))
-            elif name == "ToolGetActivePlan": res = execute_get_active_plan(user_id)
-            elif name == "ToolDraftWorkoutPlan": res = execute_draft_plan(user_id, conv_id, ToolDraftWorkoutPlan(**args))
-            elif name == "ToolCommitWorkoutPlan": res = execute_commit_plan(user_id, conv_id, ToolCommitWorkoutPlan(**args))
-            elif name == "ToolDraftPlanModification": res = execute_draft_modification(user_id, conv_id, ToolDraftPlanModification(**args))
-            elif name == "ToolCommitPlanModification": res = execute_commit_modification(user_id, conv_id, ToolCommitPlanModification(**args))
-            elif name == "ToolGetPlanProgress": res = execute_get_progress(user_id)
-            elif name == "ToolGetRecentWorkoutSessions": res = execute_get_recent_sessions(user_id, ToolGetRecentWorkoutSessions(**args))
-            elif name == "ToolGetExerciseTrend": res = execute_analyze_exercise_trend(user_id, ToolGetExerciseTrend(**args))
-            elif name == "ToolGetConsistencyStats": res = execute_get_consistency(user_id)
-            elif name == "ToolGetPendingActions": res = execute_get_pending_actions(user_id, conv_id)
-            else: res = {"success": False, "error": f"Unknown tool {name}"}
+            executor = TOOL_EXECUTORS.get(name)
+            if executor:
+                res = executor(user_id, args)
+            else:
+                res = {"success": False, "error": f"Unknown tool {name}"}
         except Exception as e:
             res = {"success": False, "error_code": "TOOL_CRASH", "message": str(e)}
             
@@ -1169,6 +1241,7 @@ def get_chat_history(conversation_id: str, auth_user_id: str = Depends(get_curre
         query = text("SELECT role, content, created_at FROM chatbot_messages WHERE conversation_id = :conv_id ORDER BY created_at ASC")
         rows = conn.execute(query, {"conv_id": conversation_id}).mappings().fetchall()
         return [{"role": r["role"], "content": clean_ai_response(r["content"]) if r["role"] == "assistant" else r["content"], "created_at": r["created_at"]} for r in rows]
+
 
 @app.post("/api/v1/chat/conversations/{conversation_id}/messages")
 def add_chat_message(conversation_id: str, message: ChatMessageCreate, auth_user_id: str = Depends(get_current_user_id)):
