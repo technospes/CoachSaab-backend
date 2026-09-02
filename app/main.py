@@ -1123,6 +1123,36 @@ def toggle_plan_completion(plan_id: str, payload: DayCompletionToggle, auth_user
         conn.execute(query, {"pid": plan_id, "uid": auth_user_id, "wn": payload.week_number, "dn": payload.day_number})
     return {"status": "success"}
 
+
+@app.get("/api/v1/chat/conversations")
+def get_user_conversations(auth_user_id: str = Depends(get_current_user_id)):
+    """
+    Retrieves all conversations for the authenticated user securely via JWT.
+    Returns them ordered newest first.
+    """
+    try:
+        with engine.connect() as conn:
+            # Query the database exclusively using the verified JWT user_id
+            query = text("""
+                SELECT conversation_id as id, created_at 
+                FROM chatbot_conversations 
+                WHERE user_id = :uid 
+                ORDER BY created_at DESC
+            """)
+            rows = conn.execute(query, {"uid": auth_user_id}).mappings().fetchall()
+            
+        # Format the response for the Flutter client
+        return [
+            {
+                "id": str(r["id"]), 
+                "created_at": str(r["created_at"])
+            } for r in rows
+        ]
+    except Exception as e:
+        print(f"Error fetching conversations: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retrieve conversations")
+
+
 @app.post("/api/v1/chat/conversations")
 def create_conversation(auth_user_id: str = Depends(get_current_user_id)):
     with engine.begin() as conn:
