@@ -742,7 +742,15 @@ def execute_get_recent_sessions(user_id: str, args: ToolGetRecentWorkoutSessions
     try:
         with engine.connect() as conn:
             rows = conn.execute(text("SELECT activity_key, reps, form_score, dominant_deviation, created_at FROM workout_sessions WHERE user_id = :uid ORDER BY created_at DESC LIMIT :limit"), {"uid": user_id, "limit": args.limit}).mappings().fetchall()
-        return {"success": True, "recent_sessions": [dict(r) for r in rows]}
+        formatted_sessions = []
+        for r in rows:
+            session = dict(r)
+            if session["activity_key"] and "run" in session["activity_key"].lower():
+                session["steps"] = session.pop("reps")
+                session["average_spm"] = session.pop("form_score")
+            formatted_sessions.append(session)
+            
+        return {"success": True, "recent_sessions": formatted_sessions}
     except Exception as e: return _safe_db_error(e, "get_recent_sessions")
 
 def execute_analyze_exercise_trend(user_id: str, args: ToolGetExerciseTrend) -> dict:
@@ -810,8 +818,6 @@ def execute_get_detailed_session_report(user_id: str, args: ToolGetDetailedSessi
     try:
         with engine.connect() as conn:
             if args.activity_key:
-                # 🚀 NORMALIZE THE KEY: lowercase, strip spaces, and remove trailing 's' 
-                # (unless it's a word that naturally ends in 's' like 'press')
                 normalized_key = args.activity_key.lower().strip()
                 if normalized_key.endswith('s') and not normalized_key.endswith('ss'):
                     normalized_key = normalized_key[:-1]
@@ -835,16 +841,24 @@ def execute_get_detailed_session_report(user_id: str, args: ToolGetDetailedSessi
         if not row: 
             return {"success": False, "message": "No recent session found matching that criteria."}
             
+        is_run = "run" in row["activity_key"].lower()
+        session_data = {
+            "activity": row["activity_key"],
+            "duration_seconds": row["duration_seconds"],
+            "date": str(row["created_at"])
+        }
+        
+        if is_run:
+            session_data["steps"] = row["reps"]
+            session_data["average_spm"] = row["form_score"]
+        else:
+            session_data["reps"] = row["reps"]
+            session_data["form_score"] = row["form_score"]
+            
         return {
             "success": True,
-            "session": {
-                "activity": row["activity_key"],
-                "reps": row["reps"],
-                "duration_seconds": row["duration_seconds"],
-                "form_score": row["form_score"],
-                "date": str(row["created_at"])
-            },
-            "rep_summary": row["deviations_json"] # The structured JSON saved directly from Flutter
+            "session": session_data,
+            "rep_summary": row["deviations_json"] 
         }
     except Exception as e: 
         return _safe_db_error(e, "get_detailed_session_report")
