@@ -972,62 +972,127 @@ def clean_ai_response(text_content: str) -> str:
     cleaned = cleaned.replace("<br>", "\n").replace("<br/>", "\n").replace("<br />", "\n")
     return cleaned.strip()
 
+from typing import Optional
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import text
+
 @app.get("/api/v1/users/{user_id}/dashboard")
-def get_dashboard_data(user_id: str, timeframe: str = "This Week", auth_user_id: str = Depends(get_current_user_id)):
-    if user_id != auth_user_id: raise HTTPException(403, "Forbidden")
-    
-    if timeframe == "This Week": interval_str = "7 days"
-    elif timeframe == "This Month": interval_str = "30 days"
-    elif timeframe == "Last 4 Weeks": interval_str = "28 days"
-    elif timeframe == "All Time": interval_str = "36500 days" 
-    else: interval_str = "7 days" 
-    
+def get_dashboard_data(
+    user_id: str,
+    timeframe: str = "This Week",
+    activity_key: Optional[str] = None, 
+    auth_user_id: str = Depends(get_current_user_id)
+):
+    if user_id != auth_user_id:
+        raise HTTPException(status_code=403, detail="Forbidden")
+
+    # Map timeframe to SQL interval
+    if timeframe == "This Week":
+        interval_str = "7 days"
+    elif timeframe == "This Month":
+        interval_str = "30 days"
+    elif timeframe == "Last 4 Weeks":
+        interval_str = "28 days"
+    elif timeframe == "All Time":
+        interval_str = "36500 days"
+    else:
+        interval_str = "7 days"
+
+    # Get consistency (remains global)
     cons_data = execute_get_consistency(user_id)
     consistency_rate = cons_data.get("overall_completion_rate", "0%")
-    
+
     try:
         with engine.connect() as conn:
-            rows = conn.execute(
-                text(f"SELECT activity_key, reps, form_score, dominant_deviation, created_at FROM workout_sessions WHERE user_id = :uid AND created_at >= NOW() - INTERVAL '{interval_str}' ORDER BY created_at ASC"),
-                {"uid": user_id}
-            ).mappings().fetchall()
-            
-        total_workouts = len(rows)
-        total_reps = sum(r["reps"] for r in rows)
-        avg_form = sum(r["form_score"] for r in rows) / total_workouts if total_workouts > 0 else 0
-        
-        deviations = [r["dominant_deviation"] for r in rows if r["dominant_deviation"]]
-        issue_counts = {}
-        for d in deviations:
-            clean_name = d.replace("_", " ").title()
-            issue_counts[clean_name] = issue_counts.get(clean_name, 0) + 1
-        top_issues = [{"issue": k, "count": v} for k, v in sorted(issue_counts.items(), key=lambda item: item[1], reverse=True)[:3]]
-        
-        ex_data = {}
-        for r in rows:
-            key = r['activity_key'].title()
-            if key not in ex_data: ex_data[key] = []
-            ex_data[key].append(r["form_score"])
-            
-        ex_perf = []
-        for k, scores in ex_data.items():
-            prev = scores[0] if len(scores) > 0 else 0
-            curr = scores[-1] if len(scores) > 0 else 0
-            if len(scores) >= 3:
-                mid = len(scores) // 2
-                prev = sum(scores[:mid]) / len(scores[:mid])
-                curr = sum(scores[mid:]) / len(scores[mid:])
-            ex_perf.append({"name": k, "previous": round(prev), "current": round(curr)})
-            
-        trend_data = [r["form_score"] for r in rows[-7:]]
-        if len(trend_data) < 7: trend_data = [0] * (7 - len(trend_data)) + trend_data
+            # 🚀 BUG 1 FIXED: Renamed the bind param to :ak to avoid asyncpg namespace collision
+            if activity_key and activity_key != 'all':
+                query = text(f"""
+                    SELECT activity_key, reps, form_score, dominant_deviation, created_at 
+                    FROM workout_sessions 
+                    WHERE user_id = :uid 
+                      AND created_at >= NOW() - INTERVAL '{interval_str}'
+                      AND activity_key = :ak
+                    ORDER BY created_at ASC
+                """)
+                params = {"uid": user_id, "ak": activity_key}
+            else:
+                query = text(f"""
+                    SELECT activity_key, reps, form_score, dominant_deviation, created_at 
+                    FROM workout_sessions 
+                    WHERE user_id = :uid 
+                      AND created_at >= NOW() - INTERVAL '{interval_str}'
+                    ORDER BY created_at ASC
+                """)
+                params = {"uid": user_id}
 
-        return {
-            "total_workouts": total_workouts, "consistency": consistency_rate, "total_reps": total_reps,
-            "avg_form_score": round(avg_form), "trend_data": trend_data, "common_issues": top_issues, "exercise_performance": ex_perf
-        }
+            rows = conn.execute(query, params).mappings().fetchall()
+
+            total_workouts = len(rows)
+            total_reps = sum([r["reps"] for r in rows if r["reps"]])
+            
+            form_scores = [r["form_score"] for r in rows if r["form_score"]]
+            avg_form = sum(form_scores) / len(form_scores) if form_scores else 0
+            
+            # Trend is the last 7 sessions
+            trend_data = [r["form_score"] for r in rows[-7:]]
+
+            # Common Issues logic
+            issues = {}
+            for r in rows:
+                dev = r["dominant_deviation"]
+                if dev and dev not in ['none', 'null', '']:
+                    issues[dev] = issues.get(dev, 0) + 1
+            sorted_issues = sorted(issues.items(), key=lambda x: x[1], reverse=True)[:3]
+            top_issues = [{"issue": k.replace("_", " ").title(), "count": v} for k, v in sorted_issues]
+
+            # Exercise Performance (Skip if filtered to a specific exercise)
+            ex_perf = []
+            if not activity_key or activity_key == 'all':
+                perf_map = {}
+                for r in rows:
+                    ak = r["activity_key"]
+                    if ak not in perf_map:
+                        perf_map[ak] = []
+                    perf_map[ak].append(r["reps"])
+                
+                for ak, reps_list in perf_map.items():
+                    if len(reps_list) >= 2:
+                        prev = reps_list[-2]
+                        curr = reps_list[-1]
+                    elif len(reps_list) == 1:
+                        prev = 0
+                        curr = reps_list[0]
+                    else:
+                        prev, curr = 0, 0
+                    
+                    # Fix display names for the broken DB keys before sending to frontend
+                    display_name = ak.replace("_", " ").title()
+                    if display_name == "Quat": display_name = "Squat"
+                    if display_name == "Tree Poe": display_name = "Tree Pose"
+                    if display_name == "Bicep Curl": display_name = "Bicep Curls"
+
+                    ex_perf.append({
+                        "name": display_name,
+                        "previous": prev,
+                        "current": curr
+                    })
+
+            is_run = activity_key and activity_key.lower().startswith('run')
+
+            return {
+                "total_workouts": total_workouts,
+                "consistency": consistency_rate,
+                "total_reps": total_reps,
+                "avg_form_score": round(avg_form),
+                "trend_data": trend_data,
+                "common_issues": top_issues,
+                "exercise_performance": ex_perf,
+                "metric_type": "cadence" if is_run else "form_score",
+                "primary_metric_label": "Avg SPM" if is_run else "Avg Form",
+            }
     except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+        print(f"Error fetching dashboard: {e}")
+        raise HTTPException(status_code=500, detail="Internal Server Error")
 
 class ChatMessageCreate(BaseModel):
     role: str
