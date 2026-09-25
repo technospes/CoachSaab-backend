@@ -1,0 +1,15 @@
+name: Keep Render Alive
+on:
+  schedule:
+    # Runs every 14 minutes, but ONLY between 9 AM and 11 PM UTC
+    - cron: '*/14 9-23 * * *'
+  workflow_dispatch:
+
+jobs:
+  ping:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Ping Render Health Endpoint
+        run: |
+          curl -s -o /dev/null -w "%{http_code}" \
+            https://coachsaab-api.onrender.com/api/v1/health
