@@ -1,9 +1,8 @@
 name: Keep Render Alive
 on:
   schedule:
-    # Runs every 5 minutes.
-    # 3-17 UTC roughly translates to 8:30 AM to 11:30 PM IST.
-    - cron: '*/5 3-17 * * *'
+    # Runs every 10 minutes, from 8:30 AM to 11:30 PM IST
+    - cron: '*/10 3-18 * * *'
   workflow_dispatch:
 
 jobs:
