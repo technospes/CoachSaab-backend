@@ -1,8 +1,9 @@
 name: Keep Render Alive
 on:
   schedule:
-    # Runs every 10 minutes, from 8:30 AM to 11:30 PM IST
-    - cron: '*/10 3-18 * * *'
+    # Runs every 3 minutes from 8:30 AM to 11:29 PM IST
+    # Survives GitHub's worst-case 10-minute queue delays
+    - cron: '*/3 3-17 * * *'
   workflow_dispatch:
 
 jobs:
