@@ -1,7 +1,8 @@
 name: Keep Render Alive
 on:
   schedule:
-    - cron: '*/3 0-20 * * *'
+    # Temporarily running 24/7 for the hackathon all-nighter
+    - cron: '*/3 * * * *'
   workflow_dispatch:
 
 jobs:
