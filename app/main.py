@@ -45,6 +45,14 @@ GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.2)
 
 # ==========================================
+# HEALTH KEEP-ALIVE ENDPOINT
+# ==========================================
+@app.get("/api/v1/health")
+def health_check():
+    """Lightweight keep-alive endpoint for cron jobs. Does not touch the database."""
+    return {"status": "awake", "app": "CoachSaab"}
+
+# ==========================================
 # 1. STRICT JWT AUTHENTICATION & HASHING
 # ==========================================
 JWT_SECRET_KEY = os.getenv("JWT_SECRET_KEY")
