@@ -18,6 +18,7 @@ from langgraph.graph import StateGraph, START, END
 from langgraph.graph.message import add_messages
 from langchain_core.messages import SystemMessage, HumanMessage, AIMessage, ToolMessage
 from langchain_groq import ChatGroq
+from langchain_core.runnables import RunnableConfig 
 
 # Google Auth
 from google.oauth2 import id_token
@@ -43,6 +44,12 @@ engine = create_engine(DATABASE_URL)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 llm = ChatGroq(model=GROQ_MODEL, api_key=GROQ_API_KEY, temperature=0.2)
+
+fast_router_llm = ChatGroq(
+    model="openai/gpt-oss-20b",
+    api_key=GROQ_API_KEY,
+    temperature=0
+)
 
 # ==========================================
 # HEALTH KEEP-ALIVE ENDPOINT
@@ -374,6 +381,14 @@ def get_current_user(auth_user_id: str = Depends(get_current_user_id)):
 # ==========================================
 # PYDANTIC SCHEMAS (Existing)
 # ==========================================
+
+class IntentClassification(BaseModel):
+    is_fitness_related: bool = Field(
+        description="True ONLY if the query is strictly about fitness, exercise, diet, motivation, injury prevention, or workout data. False for general knowledge, coding, history, politics, etc."
+    )
+
+intent_classifier = fast_router_llm.with_structured_output(IntentClassification)
+
 class ScheduledExercise(BaseModel):
     exercise_id: str
     name: str
@@ -899,6 +914,18 @@ def agent_node(state: AgentState):
         1. PROPOSE BEFORE EXECUTION: For ANY plan creation or modification, use `ToolDraft...` first.
         2. FORMATTING: Clean bullet points only. NO HTML tags like <br>. NO Markdown tables. NO <think> tags.
         3. PRIVACY: Never expose database IDs, tokens, or backend implementation details.
+        4. STRICT DOMAIN RESTRICTION: You ONLY answer questions related to:
+           - Fitness, training, and exercise technique
+           - Injury prevention, mobility, and recovery
+           - Diet and nutrition for fitness goals
+           - Workout planning and programming
+           - Motivation and mindset for training
+           - Analysis of the user's own workout data
+           
+           For ANYTHING else — history, politics, general knowledge, coding, programming, AI/ML concepts, science unrelated to exercise, news, entertainment, or non-fitness personal questions — politely decline and redirect to fitness.
+           
+           Example refusal: "I'm your fitness coach, so I stick to training, nutrition, and recovery. Want to talk about today's workout or your plan?"
+        5. TOOL GUARDRAIL: Before calling ANY tool, confirm the request is strictly fitness-related. NEVER call plan-creation or profile tools for off-topic requests.
         
         SESSION ANALYSIS & COACHING PROTOCOL:
         When the user asks about a specific workout/session:
@@ -1340,6 +1367,57 @@ def add_chat_message(conversation_id: str, message: ChatMessageCreate, auth_user
     with engine.begin() as conn:
         conv_row = conn.execute(text("SELECT user_id FROM chatbot_conversations WHERE conversation_id = :conv_id"), {"conv_id": conversation_id}).mappings().fetchone()
         if not conv_row or str(conv_row['user_id']) != auth_user_id: raise HTTPException(status_code=403, detail="Forbidden")
+
+    # --- LAYER 2: SEMANTIC INTENT ROUTER ---
+    try:
+        classification = intent_classifier.invoke(
+            [
+                SystemMessage(content=(
+                    "You are an intent classifier for a fitness coaching app. "
+                    "Determine if the user's message is related to: fitness, exercise, "
+                    "workout technique, injury prevention, nutrition/diet for training, "
+                    "motivation, recovery, or analysis of the user's own workout data.\n\n"
+                    "Return TRUE for any fitness/health question, including injury and nutrition.\n"
+                    "Return FALSE for: history, politics, coding, general knowledge, "
+                    "science unrelated to exercise, entertainment, personal non-fitness questions, "
+                    "or any other off-topic subject.\n\n"
+                    "Err on the side of TRUE for anything ambiguous. When in doubt, let the "
+                    "main coaching agent decide."
+                )),
+                HumanMessage(content=message.content),
+            ],
+            config=RunnableConfig(timeout=5),
+        )
+
+        print(f"[ROUTER] message='{message.content}' classified as fitness={classification.is_fitness_related}")
+
+        if not classification.is_fitness_related:
+            refusal_text = (
+                "I'm your fitness coach, so I stick to training, nutrition, and recovery. "
+                "What can I help you with?"
+            )
+            with engine.begin() as conn:
+                conn.execute(
+                    text("INSERT INTO chatbot_messages (conversation_id, role, content) "
+                         "VALUES (:conv_id, 'user', :content)"),
+                    {"conv_id": conversation_id, "content": message.content},
+                )
+                result = conn.execute(
+                    text("INSERT INTO chatbot_messages (conversation_id, role, content) "
+                         "VALUES (:conv_id, 'assistant', :content) "
+                         "RETURNING message_id, role, content, created_at"),
+                    {"conv_id": conversation_id, "content": refusal_text},
+                ).mappings().fetchone()
+
+            response_dict = dict(result)
+            response_dict["message_id"] = str(response_dict["message_id"])
+            response_dict["created_at"] = str(response_dict["created_at"])
+            return response_dict
+
+    except Exception as e:
+        print(f"Router bypassed due to error or timeout: {e}")
+        # Fail open — execution continues to the main agent below
+    # ---------------------------------------
 
     try:
         with engine.connect() as conn:
